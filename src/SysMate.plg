@@ -1,0 +1,115 @@
+<html>
+<body>
+<pre>
+<h1>Build Log</h1>
+<h3>
+--------------------Configuration: SysMate - Win32 Release--------------------
+</h3>
+<h3>Command Lines</h3>
+Creating command line "midl.exe /nologo /D "NDEBUG" /tlb "Release/SysMate.tlb" /mktyplib203 /win32 "C:\Documents and Settings\Zac Walker\Desktop\SysMate\SysMate.odl""
+Creating command line "rc.exe /l 0x809 /fo"Release/SysMate.res" /i "Release" /d "NDEBUG" "C:\Documents and Settings\Zac Walker\Desktop\SysMate\SysMate.rc"" 
+Creating temporary file "C:\DOCUME~1\ZACWAL~1\LOCALS~1\Temp\RSP11.tmp" with contents
+[
+/nologo /MT /W3 /GX /O2 /D "WIN32" /D "NDEBUG" /D "_WINDOWS" /D "_MBCS" /D "_REG_MFC_BUILD" /FR"Release/" /Fp"Release/SysMate.pch" /Yu"stdafx.h" /Fo"Release/" /Fd"Release/" /FD /c 
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\ComView.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\FileVersion.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\MainFrm.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\NetworkView.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\Performance.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\Performance98.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\PerformanceNT.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\PerformanceWnd.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\PrintTreeView.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\ProcessFindReplaceDialog.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\ProcessView.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\ProgDlg.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\RegMFC.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\SimpleProcessAPI.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\Splash.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\SysMate.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\SysMateDoc.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\TabWnd.cpp"
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\WindowView.cpp"
+]
+Creating command line "cl.exe @C:\DOCUME~1\ZACWAL~1\LOCALS~1\Temp\RSP11.tmp" 
+Creating temporary file "C:\DOCUME~1\ZACWAL~1\LOCALS~1\Temp\RSP12.tmp" with contents
+[
+/nologo /MT /W3 /GX /O2 /D "WIN32" /D "NDEBUG" /D "_WINDOWS" /D "_MBCS" /D "_REG_MFC_BUILD" /FR"Release/" /Fp"Release/SysMate.pch" /Yc"stdafx.h" /Fo"Release/" /Fd"Release/" /FD /c 
+"C:\Documents and Settings\Zac Walker\Desktop\SysMate\StdAfx.cpp"
+]
+Creating command line "cl.exe @C:\DOCUME~1\ZACWAL~1\LOCALS~1\Temp\RSP12.tmp" 
+Creating temporary file "C:\DOCUME~1\ZACWAL~1\LOCALS~1\Temp\RSP13.tmp" with contents
+[
+snmpapi.lib /nologo /subsystem:windows /incremental:no /pdb:"Release/SysMate.pdb" /machine:I386 /out:"Release/SysMate.exe" 
+".\Release\ComView.obj"
+".\Release\FileVersion.obj"
+".\Release\MainFrm.obj"
+".\Release\NetworkView.obj"
+".\Release\Performance.obj"
+".\Release\Performance98.obj"
+".\Release\PerformanceNT.obj"
+".\Release\PerformanceWnd.obj"
+".\Release\PrintTreeView.obj"
+".\Release\ProcessFindReplaceDialog.obj"
+".\Release\ProcessView.obj"
+".\Release\ProgDlg.obj"
+".\Release\RegMFC.obj"
+".\Release\SimpleProcessAPI.obj"
+".\Release\Splash.obj"
+".\Release\StdAfx.obj"
+".\Release\SysMate.obj"
+".\Release\SysMateDoc.obj"
+".\Release\TabWnd.obj"
+".\Release\WindowView.obj"
+".\Release\SysMate.res"
+]
+Creating command line "link.exe @C:\DOCUME~1\ZACWAL~1\LOCALS~1\Temp\RSP13.tmp"
+<h3>Output Window</h3>
+Creating Type Library...
+Processing C:\Documents and Settings\Zac Walker\Desktop\SysMate\SysMate.odl
+SysMate.odl
+Processing C:\Program Files\Microsoft Platform SDK\include\oaidl.idl
+oaidl.idl
+Processing C:\Program Files\Microsoft Platform SDK\include\objidl.idl
+objidl.idl
+Processing C:\Program Files\Microsoft Platform SDK\include\unknwn.idl
+unknwn.idl
+Processing C:\Program Files\Microsoft Platform SDK\include\wtypes.idl
+wtypes.idl
+Processing C:\DXSDK\include\basetsd.h
+basetsd.h
+Processing C:\Program Files\Microsoft Platform SDK\include\guiddef.h
+guiddef.h
+Compiling resources...
+Compiling...
+StdAfx.cpp
+Compiling...
+ComView.cpp
+FileVersion.cpp
+MainFrm.cpp
+NetworkView.cpp
+Performance.cpp
+Performance98.cpp
+PerformanceNT.cpp
+PerformanceWnd.cpp
+PrintTreeView.cpp
+ProcessFindReplaceDialog.cpp
+ProcessView.cpp
+ProgDlg.cpp
+RegMFC.cpp
+SimpleProcessAPI.cpp
+Splash.cpp
+SysMate.cpp
+SysMateDoc.cpp
+TabWnd.cpp
+WindowView.cpp
+Generating Code...
+Linking...
+
+
+
+<h3>Results</h3>
+SysMate.exe - 0 error(s), 0 warning(s)
+</pre>
+</body>
+</html>
