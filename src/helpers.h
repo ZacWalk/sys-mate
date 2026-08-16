@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <initializer_list>
 #include "layout.h"
+#include "dark_theme.h"
 
 // ============================================================
 // CRTP self-pointer thunk for window classes
@@ -34,11 +35,12 @@ struct OwnedWnd
 };
 
 // ============================================================
-// Window class registration helper (idempotent via static guard)
+// Window class registration helper (idempotent)
 // ============================================================
 inline void RegisterSimpleClass(HINSTANCE hInst, LPCWSTR name, WNDPROC proc, UINT style = 0)
 {
 	WNDCLASSW wc = {};
+	if (GetClassInfoW(hInst, name, &wc)) return;
 	wc.style = style;
 	wc.lpfnWndProc = proc;
 	wc.hInstance = hInst;
@@ -109,6 +111,7 @@ struct VScroll
 	int trackBottom = 0;
 	int sbX = 0;
 	int sbRight = 0;
+	int wheelAccum = 0;
 
 	int MaxScroll() const { return std::max(0, contentH - viewH); }
 	bool Needed() const { return contentH > viewH; }
@@ -172,15 +175,35 @@ struct VScroll
 		return true;
 	}
 
+	// `unitPerLine` converts a scroll line into this scrollbar's unit (rows or pixels).
+	// Accumulates sub-notch deltas so high-resolution wheels/touchpads still scroll.
+	bool OnMouseWheel(int delta, int unitPerLine)
+	{
+		// SPI_GETWHEELSCROLLLINES reports UINT_MAX to mean "one screen per notch".
+		UINT lines = 3;
+		SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+		const int unitPerNotch = (lines == UINT_MAX)
+			                         ? std::max(1, viewH - 1)
+			                         : std::max(1, static_cast<int>(lines) * unitPerLine);
+
+		wheelAccum += delta;
+		const int notches = wheelAccum / WHEEL_DELTA;
+		if (notches == 0) return false;
+		wheelAccum -= notches * WHEEL_DELTA;
+
+		const int before = pos;
+		pos -= notches * unitPerNotch;
+		Clamp();
+		return pos != before;
+	}
+
 	void Draw(HDC dc) const
 	{
 		if (!Needed()) return;
-		static HBRUSH bg = CreateSolidBrush(RGB(35, 35, 38));
-		static HBRUSH thumbBr = CreateSolidBrush(RGB(80, 80, 85));
 		RECT bgRc = {sbX, trackTop, sbRight, trackBottom};
-		FillRect(dc, &bgRc, bg);
+		FillRect(dc, &bgRc, Dark::BrushScrollTrack());
 		RECT t = ThumbRect();
-		FillRect(dc, &t, thumbBr);
+		FillRect(dc, &t, Dark::BrushScrollThumb());
 	}
 };
 
@@ -254,6 +277,26 @@ namespace Format
 		WCHAR buf[32];
 		_snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%.2f GHz", mhz / 1000.0);
 		return buf;
+	}
+
+	// Auto-scaled byte count, e.g. "512 KB", "1.4 GB".
+	inline std::wstring Bytes(double bytes)
+	{
+		static const WCHAR* kUnits[] = {L"B", L"KB", L"MB", L"GB", L"TB", L"PB"};
+		int unit = 0;
+		while (bytes >= 1024.0 && unit + 1 < static_cast<int>(_countof(kUnits)))
+		{
+			bytes /= 1024.0;
+			unit++;
+		}
+		WCHAR buf[32];
+		_snwprintf_s(buf, _countof(buf), _TRUNCATE, unit == 0 ? L"%.0f %s" : L"%.1f %s", bytes, kUnits[unit]);
+		return buf;
+	}
+
+	inline std::wstring Rate(double bytesPerSec)
+	{
+		return Bytes(bytesPerSec) + L"/s";
 	}
 
 	inline std::wstring U(unsigned v)

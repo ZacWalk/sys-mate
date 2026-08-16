@@ -21,6 +21,8 @@ namespace Dpi
 // ============================================================
 namespace Layout
 {
+	constexpr int MinWindowWidth = 560;
+	constexpr int MinWindowHeight = 400;
 	constexpr int TabHeight = 30;
 	constexpr int BottomBarHeight = 34;
 	constexpr int ButtonWidth = 130;
@@ -36,6 +38,7 @@ namespace Layout
 	constexpr int ScrollbarThumbMin = 20;
 	constexpr int HeaderEdgeHitZone = 4;
 	constexpr int MinColumnWidth = 30;
+	constexpr int SortArrowWidth = 14;
 	constexpr int ChartGridMargin = 8;
 	constexpr int ChartSpacing = 8;
 	constexpr int ChartPadding = 4;
@@ -95,22 +98,15 @@ inline void DrawTextExt(const HDC hdc, const WCHAR* text, int len, const RECT& r
 
 	if ((flags & TextAlign::Ellipsis) && sz.cx > rcW)
 	{
+		static constexpr WCHAR kEllipsis[] = L"\u2026";
 		SIZE ellipSz;
-		GetTextExtentPoint32W(hdc, L"...", 3, &ellipSz);
-		int fitLen = len;
-		while (fitLen > 0)
-		{
-			fitLen--;
-			SIZE testSz;
-			GetTextExtentPoint32W(hdc, text, fitLen, &testSz);
-			if (testSz.cx + ellipSz.cx <= rcW)
-			{
-				truncated.assign(text, fitLen);
-				truncated += L"...";
-				break;
-			}
-		}
-		if (truncated.empty()) truncated = L"...";
+		GetTextExtentPoint32W(hdc, kEllipsis, 1, &ellipSz);
+		const int avail = rcW - ellipSz.cx;
+		int fit = 0;
+		if (avail > 0)
+			GetTextExtentExPointW(hdc, text, len, avail, &fit, nullptr, &sz);
+		truncated.assign(text, fit);
+		truncated += kEllipsis;
 		drawText = truncated.c_str();
 		drawLen = static_cast<int>(truncated.size());
 		GetTextExtentPoint32W(hdc, drawText, drawLen, &sz);

@@ -28,6 +28,19 @@ public:
 
 	void AddTab(const WCHAR* text) { m_tabs.push_back({text}); InvalidateRect(m_hWnd, nullptr, FALSE); }
 	int GetCurSel() const { return m_selected; }
+	int GetCount() const { return (int)m_tabs.size(); }
+
+	void SetHeight(int height)
+	{
+		m_height = height;
+		InvalidateRect(m_hWnd, nullptr, FALSE);
+	}
+
+	void SetFont(HFONT hFont)
+	{
+		m_hFont = hFont;
+		InvalidateRect(m_hWnd, nullptr, FALSE);
+	}
 
 	void SetCurSel(int idx)
 	{
@@ -92,8 +105,7 @@ private:
 		if (m_tabs.empty()) return -1;
 		RECT rc;
 		GetClientRect(m_hWnd, &rc);
-		int tabW = rc.right / (int)m_tabs.size();
-		if (tabW < 60) tabW = 60;
+		const int tabW = TabWidth(rc.right);
 		for (int i = 0; i < (int)m_tabs.size(); i++)
 		{
 			RECT tr = {i * tabW, 0, (i + 1) * tabW, rc.bottom};
@@ -101,6 +113,12 @@ private:
 			if (PtInRect(&tr, pt)) return i;
 		}
 		return -1;
+	}
+
+	int TabWidth(int clientW) const
+	{
+		if (m_tabs.empty()) return Dpi::Scale(60);
+		return std::max(Dpi::Scale(60), clientW / (int)m_tabs.size());
 	}
 
 	void OnPaint()
@@ -113,8 +131,7 @@ private:
 
 		if (!m_tabs.empty())
 		{
-			int tabW = rc.right / (int)m_tabs.size();
-			if (tabW < 60) tabW = 60;
+			const int tabW = TabWidth(rc.right);
 
 			SelectObject(memDC, m_hFont);
 			SetBkMode(memDC, TRANSPARENT);
@@ -137,8 +154,8 @@ private:
 				if (sel)
 				{
 					RECT accent = tr;
-					accent.bottom = accent.top + 2;
-					HBRUSH acBr = CreateSolidBrush(RGB(0, 150, 255));
+					accent.bottom = accent.top + Dpi::Scale(2);
+					HBRUSH acBr = CreateSolidBrush(Dark::Accent);
 					FillRect(memDC, &accent, acBr);
 					DeleteObject(acBr);
 				}
@@ -171,30 +188,45 @@ public:
 		m_hFont = hFont;
 		m_hFontBold = hFontBold;
 		m_hInst = hInst;
-		m_rowHeight = Dpi::Scale(Layout::ListRowHeight);
-		m_headerHeight = Dpi::Scale(Layout::ListHeaderHeight);
-		m_scrollbarWidth = Dpi::Scale(Layout::ScrollbarWidth);
-		m_cellPadding = Dpi::Scale(Layout::ListCellPadding);
+		UpdateMetrics();
 
 		RegisterSimpleClass(hInst, L"SystemStuffCustomLV", &Thunk, CS_DBLCLKS);
 
 		m_hWnd = CreateWindowExW(0, L"SystemStuffCustomLV", L"",
-			WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+			WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_TABSTOP,
 			0, 0, 100, 100, hParent, nullptr, hInst, this);
 	}
 
 	HWND GetHWND() const { return m_hWnd; }
 
-	void AddColumn(const WCHAR* text, int width) { m_columns.push_back({text, width}); }
+	// Re-scales cached metrics and column widths after a DPI change.
+	void OnDpiChanged(HFONT hFont, HFONT hFontBold, float scaleRatio)
+	{
+		m_hFont = hFont;
+		m_hFontBold = hFontBold;
+		UpdateMetrics();
+		for (auto& c : m_columns)
+			c.width = std::max(Dpi::Scale(Layout::MinColumnWidth),
+			                   static_cast<int>(c.width * scaleRatio + 0.5f));
+		UpdateScrollInfo();
+		InvalidateRect(m_hWnd, nullptr, FALSE);
+	}
+
+	// `width` is a base value at 96 DPI.
+	void AddColumn(const WCHAR* text, int width) { m_columns.push_back({text, Dpi::Scale(width)}); }
+
+	// Text shown when the list has no rows.
+	void SetEmptyText(std::wstring text) { m_emptyText = std::move(text); }
 
 	int AddItem(const WCHAR* text)
 	{
 		std::vector<std::wstring> row;
+		row.reserve(m_columns.size());
 		row.push_back(text);
 		for (size_t i = 1; i < m_columns.size(); i++) row.push_back(L"");
-		m_rows.push_back(row);
+		m_rows.push_back(std::move(row));
 		m_itemData.push_back(0);
-		UpdateScrollInfo();
+		if (m_redrawEnabled) UpdateScrollInfo();
 		return (int)m_rows.size() - 1;
 	}
 
@@ -234,12 +266,20 @@ public:
 		m_rows.clear();
 		m_itemData.clear();
 		m_selected = -1;
+		m_hot = -1;
 		m_scroll.pos = 0;
-		UpdateScrollInfo();
+		if (m_redrawEnabled) UpdateScrollInfo();
 	}
 
 	int GetItemCount() const { return (int)m_rows.size(); }
 	int GetSelected() const { return m_selected; }
+
+	int FindItemByData(LPARAM data) const
+	{
+		for (size_t i = 0; i < m_itemData.size(); i++)
+			if (m_itemData[i] == data) return (int)i;
+		return -1;
+	}
 
 	void SetSelected(int idx)
 	{
@@ -256,6 +296,7 @@ public:
 		m_redrawEnabled = redraw;
 		if (redraw)
 		{
+			ApplySort();
 			UpdateScrollInfo();
 			InvalidateRect(m_hWnd, nullptr, FALSE);
 		}
@@ -278,14 +319,22 @@ public:
 			return 0;
 		case WM_ERASEBKGND: return 1;
 
+		// Claim the keys we handle so IsDialogMessage leaves them to us.
+		case WM_GETDLGCODE: return DLGC_WANTARROWS;
+
+		case WM_SETFOCUS:
+		case WM_KILLFOCUS:
+			InvalidateRect(hWnd, nullptr, FALSE);
+			return 0;
+
 		case WM_LBUTTONDOWN:
 		{
 			SetFocus(hWnd);
 			int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
 
-			// Header column resize
 			if (y < m_headerHeight)
 			{
+				// Column resize takes priority over sort.
 				int col = HitTestHeaderEdge(x);
 				if (col >= 0)
 				{
@@ -294,6 +343,16 @@ public:
 					SetCapture(hWnd);
 					return 0;
 				}
+				int sortCol = HitTestHeaderCell(x);
+				if (sortCol >= 0)
+				{
+					if (sortCol == m_sortCol) m_sortAsc = !m_sortAsc;
+					else { m_sortCol = sortCol; m_sortAsc = true; }
+					ApplySort();
+					EnsureVisible(m_selected);
+					InvalidateRect(hWnd, nullptr, FALSE);
+				}
+				return 0;
 			}
 
 			// Scrollbar
@@ -304,19 +363,19 @@ public:
 				return 0;
 			}
 
-			// Row selection
-			int row = HitTestRow(y);
-			if (row >= 0 && row != m_selected)
-			{
-				m_selected = row;
-				InvalidateRect(hWnd, nullptr, FALSE);
-				if (m_onSelect) m_onSelect(row);
-			}
+			SelectRow(HitTestRow(y));
 			return 0;
 		}
 
+		case WM_RBUTTONDOWN:
+			// Right-click selects the row under the cursor before WM_CONTEXTMENU arrives.
+			SetFocus(hWnd);
+			SelectRow(HitTestRow(GET_Y_LPARAM(lParam)));
+			return 0;
+
 		case WM_LBUTTONUP:
-			if (m_scroll.OnLButtonUp() || m_headerDragCol >= 0)
+			if (m_scroll.OnLButtonUp()) return 0;
+			if (m_headerDragCol >= 0)
 			{
 				m_headerDragCol = -1;
 				ReleaseCapture();
@@ -376,68 +435,45 @@ public:
 			return 0;
 
 		case WM_MOUSEWHEEL:
-		{
 			SyncScrollGeometry();
-			int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-			m_scroll.pos -= delta / 40;
-			m_scroll.Clamp();
-			InvalidateRect(hWnd, nullptr, FALSE);
+			if (m_scroll.OnMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam), 1))
+				InvalidateRect(hWnd, nullptr, FALSE);
 			return 0;
-		}
 
 		case WM_KEYDOWN:
 			SyncScrollGeometry();
-			if (wParam == VK_UP && m_selected > 0)
+			switch (wParam)
 			{
-				m_selected--;
-				EnsureVisible(m_selected);
-				InvalidateRect(hWnd, nullptr, FALSE);
-				if (m_onSelect) m_onSelect(m_selected);
-			}
-			else if (wParam == VK_DOWN && m_selected < (int)m_rows.size() - 1)
-			{
-				m_selected++;
-				EnsureVisible(m_selected);
-				InvalidateRect(hWnd, nullptr, FALSE);
-				if (m_onSelect) m_onSelect(m_selected);
-			}
-			else if (wParam == VK_PRIOR)
-			{
-				m_scroll.pos = std::max(0, m_scroll.pos - VisibleRows());
-				InvalidateRect(hWnd, nullptr, FALSE);
-			}
-			else if (wParam == VK_NEXT)
-			{
-				m_scroll.pos = std::min(m_scroll.MaxScroll(), m_scroll.pos + VisibleRows());
-				InvalidateRect(hWnd, nullptr, FALSE);
-			}
-			else if (wParam == VK_HOME)
-			{
-				m_selected = 0;
-				m_scroll.pos = 0;
-				InvalidateRect(hWnd, nullptr, FALSE);
-				if (m_onSelect) m_onSelect(m_selected);
-			}
-			else if (wParam == VK_END && !m_rows.empty())
-			{
-				m_selected = (int)m_rows.size() - 1;
-				EnsureVisible(m_selected);
-				InvalidateRect(hWnd, nullptr, FALSE);
-				if (m_onSelect) m_onSelect(m_selected);
-			}
-			else if (wParam == VK_F5)
-			{
-				SendMessage(GetParent(GetParent(hWnd)), msg, wParam, lParam);
+			case VK_UP: if (m_selected > 0) SelectRow(m_selected - 1); break;
+			case VK_DOWN:
+				if (m_selected < (int)m_rows.size() - 1) SelectRow(m_selected + 1);
+				break;
+			case VK_PRIOR:
+				if (!m_rows.empty()) SelectRow(std::max(0, m_selected - VisibleRows()));
+				break;
+			case VK_NEXT:
+				if (!m_rows.empty())
+					SelectRow(std::min((int)m_rows.size() - 1, std::max(0, m_selected) + VisibleRows()));
+				break;
+			case VK_HOME: if (!m_rows.empty()) SelectRow(0); break;
+			case VK_END: if (!m_rows.empty()) SelectRow((int)m_rows.size() - 1); break;
+			default: return 0;
 			}
 			return 0;
 
 		case WM_CONTEXTMENU:
 		{
-			if (m_onContextMenu && m_selected >= 0)
+			if (!m_onContextMenu || m_selected < 0) return 0;
+			int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+			if (x == -1 && y == -1) // keyboard-invoked: anchor to the selected row
 			{
-				int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
-				m_onContextMenu(hWnd, x, y);
+				SyncScrollGeometry();
+				POINT pt = {m_cellPadding, m_headerHeight + (m_selected - m_scroll.pos + 1) * m_rowHeight};
+				ClientToScreen(hWnd, &pt);
+				x = pt.x;
+				y = pt.y;
 			}
+			m_onContextMenu(hWnd, x, y);
 			return 0;
 		}
 
@@ -457,6 +493,7 @@ private:
 	std::vector<Column> m_columns;
 	std::vector<std::vector<std::wstring>> m_rows;
 	std::vector<LPARAM> m_itemData;
+	std::wstring m_emptyText = L"Empty";
 	int m_selected = -1;
 	VScroll m_scroll;
 	int m_rowHeight = 22;
@@ -467,9 +504,83 @@ private:
 	int m_hot = -1;
 	int m_headerDragCol = -1;
 	int m_headerDragX = 0;
+	int m_sortCol = -1;
+	bool m_sortAsc = true;
+	static inline const std::wstring m_empty;
 
 	SelectionCallback m_onSelect;
 	ContextMenuCallback m_onContextMenu;
+
+	void UpdateMetrics()
+	{
+		m_rowHeight = Dpi::Scale(Layout::ListRowHeight);
+		m_headerHeight = Dpi::Scale(Layout::ListHeaderHeight);
+		m_scrollbarWidth = Dpi::Scale(Layout::ScrollbarWidth);
+		m_cellPadding = Dpi::Scale(Layout::ListCellPadding);
+	}
+
+	void SelectRow(int row)
+	{
+		if (row < 0 || row >= (int)m_rows.size() || row == m_selected) return;
+		m_selected = row;
+		EnsureVisible(row);
+		InvalidateRect(m_hWnd, nullptr, FALSE);
+		if (m_onSelect) m_onSelect(row);
+	}
+
+	// Numeric-aware cell compare so PIDs and sizes sort by magnitude, not lexically.
+	static int CompareCell(const std::wstring& a, const std::wstring& b)
+	{
+		WCHAR* endA = nullptr;
+		WCHAR* endB = nullptr;
+		const double na = wcstod(a.c_str(), &endA);
+		const double nb = wcstod(b.c_str(), &endB);
+		if (endA != a.c_str() && endB != b.c_str() && na != nb)
+			return na < nb ? -1 : 1;
+		return _wcsicmp(a.c_str(), b.c_str());
+	}
+
+	void ApplySort()
+	{
+		if (m_sortCol < 0 || m_rows.size() < 2) return;
+
+		// Remember the selection by identity, since sorting moves rows.
+		const LPARAM selData = (m_selected >= 0 && m_selected < (int)m_itemData.size())
+			                       ? m_itemData[m_selected] : 0;
+		const bool hadSel = m_selected >= 0;
+
+		std::vector<int> order(m_rows.size());
+		for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;
+
+		const int col = m_sortCol;
+		const bool asc = m_sortAsc;
+		std::stable_sort(order.begin(), order.end(), [&](int a, int b)
+		{
+			const std::wstring& ca = col < (int)m_rows[a].size() ? m_rows[a][col] : m_empty;
+			const std::wstring& cb = col < (int)m_rows[b].size() ? m_rows[b][col] : m_empty;
+			const int cmp = CompareCell(ca, cb);
+			return asc ? cmp < 0 : cmp > 0;
+		});
+
+		std::vector<std::vector<std::wstring>> rows;
+		std::vector<LPARAM> data;
+		rows.reserve(m_rows.size());
+		data.reserve(m_itemData.size());
+		for (const int i : order)
+		{
+			rows.push_back(std::move(m_rows[i]));
+			data.push_back(m_itemData[i]);
+		}
+		m_rows = std::move(rows);
+		m_itemData = std::move(data);
+
+		if (hadSel)
+		{
+			m_selected = -1;
+			for (size_t i = 0; i < m_itemData.size(); i++)
+				if (m_itemData[i] == selData) { m_selected = (int)i; break; }
+		}
+	}
 
 	int VisibleRows() const
 	{
@@ -526,7 +637,35 @@ private:
 		return -1;
 	}
 
+	int HitTestHeaderCell(int x) const
+	{
+		int cx = 0;
+		for (int i = 0; i < (int)m_columns.size(); i++)
+		{
+			cx += m_columns[i].width;
+			if (x < cx) return i;
+		}
+		return -1;
+	}
+
 	bool NeedsScrollbar() const { return (int)m_rows.size() > VisibleRows(); }
+
+	void DrawSortArrow(HDC dc, int x, int w) const
+	{
+		const int half = std::max(2, w / 4);
+		const int cx = x + w / 2;
+		const int cy = m_headerHeight / 2;
+		const int tip = m_sortAsc ? cy - half : cy + half;
+		const int base = m_sortAsc ? cy + half / 2 : cy - half / 2;
+		const POINT pts[3] = {{cx - half, base}, {cx + half, base}, {cx, tip}};
+		HBRUSH br = CreateSolidBrush(Dark::TextDim);
+		HGDIOBJ oldBr = SelectObject(dc, br);
+		HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+		Polygon(dc, pts, 3);
+		SelectObject(dc, oldPen);
+		SelectObject(dc, oldBr);
+		DeleteObject(br);
+	}
 
 	void OnPaint()
 	{
@@ -555,13 +694,17 @@ private:
 			FillRect(memDC, &hdrRc, Dark::BrushHeader());
 			int cx = 0;
 			SelectObject(memDC, m_hFontBold ? m_hFontBold : m_hFont);
-			SetTextColor(memDC, Dark::TextDim);
 			HPEN oldPen = (HPEN)SelectObject(memDC, s_borderPen);
 			for (int i = 0; i < (int)m_columns.size(); i++)
 			{
-				RECT tr = {cx + m_cellPadding, 0, cx + m_columns[i].width, m_headerHeight};
+				const bool sorted = (i == m_sortCol);
+				const int arrowW = sorted ? Dpi::Scale(Layout::SortArrowWidth) : 0;
+				SetTextColor(memDC, sorted ? Dark::Text : Dark::TextDim);
+				RECT tr = {cx + m_cellPadding, 0, cx + m_columns[i].width - arrowW, m_headerHeight};
 				DrawTextExt(memDC, m_columns[i].text.c_str(), -1, tr,
 					TextAlign::Left | TextAlign::VCenter | TextAlign::Ellipsis);
+				if (sorted)
+					DrawSortArrow(memDC, cx + m_columns[i].width - arrowW, arrowW);
 				cx += m_columns[i].width;
 				MoveToEx(memDC, cx - 1, 0, nullptr);
 				LineTo(memDC, cx - 1, m_headerHeight);
@@ -577,8 +720,9 @@ private:
 		{
 			SetTextColor(memDC, Dark::TextDim);
 			RECT emptyRc = {0, m_headerHeight, contentRight, rc.bottom};
-			DrawTextExt(memDC, L"Empty", -1, emptyRc, TextAlign::Center | TextAlign::VCenter);
+			DrawTextExt(memDC, m_emptyText.c_str(), -1, emptyRc, TextAlign::Center | TextAlign::VCenter);
 		}
+		const bool focused = (GetFocus() == m_hWnd);
 		int vis = VisibleRows() + 1; // +1 to draw partially visible bottom row
 		for (int vi = 0; vi < vis; vi++)
 		{
@@ -590,8 +734,8 @@ private:
 
 			if (rowIdx == m_selected)
 			{
-				FillRect(memDC, &rowRc, Dark::BrushSelected());
-				SetTextColor(memDC, Dark::TextSel);
+				FillRect(memDC, &rowRc, focused ? Dark::BrushSelected() : s_hotBrush);
+				SetTextColor(memDC, focused ? Dark::TextSel : Dark::Text);
 			}
 			else if (rowIdx == m_hot)
 			{

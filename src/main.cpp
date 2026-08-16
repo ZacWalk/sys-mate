@@ -14,6 +14,7 @@
 #include <objbase.h>
 #include <psapi.h>
 #include <pdh.h>
+#include <pdhmsg.h>
 #include <stdio.h>
 #include <uxtheme.h>
 #include <shlwapi.h>
@@ -55,6 +56,7 @@ static HFONT g_hFontTitle;
 static HFONT g_hFontSubtitle;
 static int g_nCurrentTab;
 static std::wstring g_filterText;
+static bool g_updatingFilterEdit = false; // suppresses EN_CHANGE while SwitchTab restores text
 
 enum TabId { TAB_PERFORMANCE, TAB_PROCESSES, TAB_NETWORK, TAB_WINDOWS, TAB_ABOUT, TAB_COUNT };
 
@@ -67,9 +69,11 @@ static HWND g_hTabPages[TAB_COUNT];
 // Performance tab
 // ============================================================
 static HWND g_hPerfPanel;
-static constexpr int NUM_CHARTS = 6;
+
+enum ChartId { CHART_CPU, CHART_MEM, CHART_DISK, CHART_NET, CHART_GPU, CHART_HANDLES, NUM_CHARTS };
+
 static Chart g_charts[NUM_CHARTS];
-static const wchar_t* g_chartTitles[] = {L"CPU", L"Memory", L"Disk", L"Network", L"GPU", L"Handles"};
+static const wchar_t* g_chartTitles[NUM_CHARTS] = {L"CPU", L"Memory", L"Disk", L"Network", L"GPU", L"Handles"};
 static std::deque<float> g_chartData[NUM_CHARTS];
 static constexpr int CHART_HISTORY = 60;
 static UINT_PTR g_perfTimer = 0;
@@ -78,6 +82,10 @@ static DWORDLONG g_memTotalBytes = 0;
 static DWORDLONG g_memAvailBytes = 0;
 static float g_rawHandleCount = 0;
 static float g_handleMaxSeen = 10000.f;
+static double g_netBytesPerSec = 0;
+static double g_netMaxSeen = 1024.0 * 1024.0; // 1 MB/s floor keeps an idle link from looking busy
+static float g_gpuPercent = 0;
+static bool g_gpuAvailable = false;
 
 static std::wstring g_cpuName;
 static DWORD g_cpuLogicalCores = 0;
@@ -155,6 +163,7 @@ enum
 	BTN_REFRESH_NET,
 	BTN_REFRESH_WIN, BTN_EXPLORER_WIN, BTN_KILL_WIN,
 	BTN_REFRESH_ABOUT, BTN_COPY_ABOUT, BTN_REPORT_ISSUE,
+	ID_FILTER_EDIT,
 };
 
 static HWND g_btnRefreshProc, g_btnExplorerProc, g_btnKillProc;
@@ -169,7 +178,19 @@ static PDH_HQUERY g_pdhQuery = nullptr;
 static PDH_HCOUNTER g_pdhCpu = nullptr;
 static PDH_HCOUNTER g_pdhDisk = nullptr;
 static PDH_HCOUNTER g_pdhNet = nullptr;
+static PDH_HCOUNTER g_pdhGpu = nullptr;
 static PDH_HCOUNTER g_pdhHandles = nullptr;
+
+// Adds a counter, leaving the handle null when the counter is unavailable on this machine.
+static bool AddCounter(const WCHAR* path, PDH_HCOUNTER* out)
+{
+	if (PdhAddEnglishCounterW(g_pdhQuery, path, 0, out) != ERROR_SUCCESS)
+	{
+		*out = nullptr;
+		return false;
+	}
+	return true;
+}
 
 static void InitPerfCounters()
 {
@@ -177,15 +198,16 @@ static void InitPerfCounters()
 	PdhOpenQuery(nullptr, 0, &g_pdhQuery);
 	if (g_pdhQuery)
 	{
-		PdhAddEnglishCounter(g_pdhQuery, L"\\Processor(_Total)\\% Processor Time", 0, &g_pdhCpu);
-		PdhAddEnglishCounter(g_pdhQuery, L"\\PhysicalDisk(_Total)\\% Disk Time", 0, &g_pdhDisk);
-		PdhAddEnglishCounter(g_pdhQuery, L"\\Network Interface(*)\\Bytes Total/sec", 0, &g_pdhNet);
-		PdhAddEnglishCounter(g_pdhQuery, L"\\Process(_Total)\\Handle Count", 0, &g_pdhHandles);
-		// Prime: many counters need two collects before yielding a valid delta.
-		PdhCollectQueryData(g_pdhQuery);
-		Sleep(50);
+		AddCounter(L"\\Processor(_Total)\\% Processor Time", &g_pdhCpu);
+		AddCounter(L"\\PhysicalDisk(_Total)\\% Disk Time", &g_pdhDisk);
+		AddCounter(L"\\Network Interface(*)\\Bytes Total/sec", &g_pdhNet);
+		AddCounter(L"\\Process(_Total)\\Handle Count", &g_pdhHandles);
+		// GPU Engine counters exist on Windows 10 1709+ with a WDDM 2.x driver.
+		AddCounter(L"\\GPU Engine(*)\\Utilization Percentage", &g_pdhGpu);
+		// Prime: rate counters need two collects before yielding a valid delta.
 		PdhCollectQueryData(g_pdhQuery);
 	}
+
 	static constexpr ChartColor kChartPalette[NUM_CHARTS][2] = {
 		{{0, 180, 255}, {0, 120, 200}},   // CPU
 		{{180, 0, 255}, {140, 0, 200}},   // Memory
@@ -211,27 +233,71 @@ static void PushChartSample(const int chartIdx, const float value)
 	if (g_chartData[chartIdx].size() > CHART_HISTORY) g_chartData[chartIdx].pop_front();
 }
 
+static double ReadCounter(const PDH_HCOUNTER counter)
+{
+	PDH_FMT_COUNTERVALUE val = {};
+	if (counter && PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, nullptr, &val) == ERROR_SUCCESS
+		&& val.CStatus == PDH_CSTATUS_VALID_DATA)
+		return val.doubleValue;
+	return 0.0;
+}
+
+// Reads a wildcard counter's instances into `buf`. Returns the instance count (0 on failure).
+static DWORD ReadCounterArray(const PDH_HCOUNTER counter, std::vector<BYTE>& buf)
+{
+	if (!counter) return 0;
+	DWORD size = 0, count = 0;
+	if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &size, &count, nullptr) != PDH_MORE_DATA || size == 0)
+		return 0;
+	buf.resize(size);
+	if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &size, &count,
+	                                 reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buf.data())) != ERROR_SUCCESS)
+		return 0;
+	return count;
+}
+
+// Task Manager reports GPU load as the busiest engine type, not the sum of all
+// engines (which would multiply-count 3D, copy and video queues).
+static float SampleGpuPercent(std::vector<BYTE>& buf)
+{
+	const DWORD count = ReadCounterArray(g_pdhGpu, buf);
+	// The counter can exist while no engine instance is reporting (no WDDM 2.x driver).
+	g_gpuAvailable = g_pdhGpu != nullptr && count > 0;
+	if (count == 0) return 0.f;
+	const auto* items = reinterpret_cast<const PDH_FMT_COUNTERVALUE_ITEM_W*>(buf.data());
+
+	std::vector<std::pair<std::wstring, double>> byEngineType;
+	for (DWORD i = 0; i < count; i++)
+	{
+		if (items[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA) continue;
+		const WCHAR* name = items[i].szName ? items[i].szName : L"";
+		const WCHAR* tag = wcsstr(name, L"engtype_");
+		const std::wstring key = tag ? tag + 8 : L"";
+		const auto it = std::find_if(byEngineType.begin(), byEngineType.end(),
+		                             [&](const auto& p) { return p.first == key; });
+		if (it == byEngineType.end()) byEngineType.emplace_back(key, items[i].FmtValue.doubleValue);
+		else it->second += items[i].FmtValue.doubleValue;
+	}
+
+	double busiest = 0;
+	for (const auto& p : byEngineType) busiest = std::max(busiest, p.second);
+	return static_cast<float>(std::clamp(busiest, 0.0, 100.0));
+}
+
 static void SamplePerfData()
 {
 	if (!g_pdhQuery) return;
 	PdhCollectQueryData(g_pdhQuery);
 
-	PDH_FMT_COUNTERVALUE val;
-	float cpu = 0;
-	if (g_pdhCpu && PdhGetFormattedCounterValue(g_pdhCpu, PDH_FMT_DOUBLE, nullptr, &val) == ERROR_SUCCESS)
-		cpu = static_cast<float>(val.doubleValue);
-	PushChartSample(0, cpu);
+	PushChartSample(CHART_CPU, static_cast<float>(ReadCounter(g_pdhCpu)));
 
 	MEMORYSTATUSEX ms = {sizeof(ms)};
 	GlobalMemoryStatusEx(&ms);
 	g_memTotalBytes = ms.ullTotalPhys;
 	g_memAvailBytes = ms.ullAvailPhys;
-	PushChartSample(1, static_cast<float>(ms.dwMemoryLoad));
+	PushChartSample(CHART_MEM, static_cast<float>(ms.dwMemoryLoad));
 
-	float disk = 0;
-	if (g_pdhDisk && PdhGetFormattedCounterValue(g_pdhDisk, PDH_FMT_DOUBLE, nullptr, &val) == ERROR_SUCCESS)
-		disk = static_cast<float>(val.doubleValue);
-	PushChartSample(2, disk);
+	PushChartSample(CHART_DISK, static_cast<float>(ReadCounter(g_pdhDisk)));
 
 	WCHAR diskRoot[4] = {g_systemDriveLetter, L':', L'\\', 0};
 	ULARGE_INTEGER freeAvail = {}, total = {}, totalFree = {};
@@ -241,35 +307,84 @@ static void SamplePerfData()
 		g_diskFreeBytes = totalFree.QuadPart;
 	}
 
-	float net = 0;
-	if (g_pdhNet)
-	{
-		DWORD bufSize = 0, itemCount = 0;
-		PdhGetFormattedCounterArrayW(g_pdhNet, PDH_FMT_DOUBLE, &bufSize, &itemCount, nullptr);
-		if (bufSize > 0)
-		{
-			auto* items = static_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(malloc(bufSize));
-			if (items && PdhGetFormattedCounterArrayW(g_pdhNet, PDH_FMT_DOUBLE, &bufSize, &itemCount, items) == ERROR_SUCCESS)
-			{
-				for (DWORD i = 0; i < itemCount; i++)
-					net += static_cast<float>(items[i].FmtValue.doubleValue);
-			}
-			if (items) free(items);
-		}
-		net = static_cast<float>(net / 100000000.0 * 100.0);
-	}
-	PushChartSample(3, net);
+	std::vector<BYTE> buf;
 
-	PushChartSample(4, 0.f);
-
-	float handles = 0;
-	if (g_pdhHandles && PdhGetFormattedCounterValue(g_pdhHandles, PDH_FMT_DOUBLE, nullptr, &val) == ERROR_SUCCESS)
+	// Network throughput is unbounded, so the chart auto-scales against the peak seen.
+	g_netBytesPerSec = 0;
+	if (const DWORD count = ReadCounterArray(g_pdhNet, buf))
 	{
-		g_rawHandleCount = static_cast<float>(val.doubleValue);
-		if (g_rawHandleCount > g_handleMaxSeen) g_handleMaxSeen = g_rawHandleCount * 1.2f;
-		handles = (g_handleMaxSeen > 0) ? (g_rawHandleCount / g_handleMaxSeen * 100.f) : 0.f;
+		const auto* items = reinterpret_cast<const PDH_FMT_COUNTERVALUE_ITEM_W*>(buf.data());
+		for (DWORD i = 0; i < count; i++)
+			if (items[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
+				g_netBytesPerSec += items[i].FmtValue.doubleValue;
 	}
-	PushChartSample(5, handles);
+	if (g_netBytesPerSec > g_netMaxSeen) g_netMaxSeen = g_netBytesPerSec * 1.2;
+	PushChartSample(CHART_NET, static_cast<float>(g_netBytesPerSec / g_netMaxSeen * 100.0));
+
+	g_gpuPercent = SampleGpuPercent(buf);
+	PushChartSample(CHART_GPU, g_gpuPercent);
+
+	g_rawHandleCount = static_cast<float>(ReadCounter(g_pdhHandles));
+	if (g_rawHandleCount > g_handleMaxSeen) g_handleMaxSeen = g_rawHandleCount * 1.2f;
+	PushChartSample(CHART_HANDLES, g_rawHandleCount / g_handleMaxSeen * 100.f);
+}
+
+// Big number shown in the top-right of a chart.
+static std::wstring ChartValueText(const int id)
+{
+	const float latest = g_chartData[id].empty() ? 0.f : g_chartData[id].back();
+	WCHAR buf[64];
+	switch (id)
+	{
+	case CHART_NET:
+		return Format::Rate(g_netBytesPerSec);
+	case CHART_HANDLES:
+		_snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d", static_cast<int>(g_rawHandleCount));
+		return buf;
+	case CHART_GPU:
+		if (!g_gpuAvailable) return L"n/a";
+		[[fallthrough]];
+	default:
+		_snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%.1f%%", latest);
+		return buf;
+	}
+}
+
+// Secondary line under the chart title. Empty means "no detail for this chart".
+static std::wstring ChartDetailText(const int id)
+{
+	WCHAR buf[192];
+	switch (id)
+	{
+	case CHART_CPU:
+		if (!g_cpuName.empty())
+			_snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%s  (%u cores @ %.2f GHz)",
+			             g_cpuName.c_str(), g_cpuLogicalCores, g_cpuMhz / 1000.0);
+		else
+			_snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%u logical cores @ %.2f GHz",
+			             g_cpuLogicalCores, g_cpuMhz / 1000.0);
+		return buf;
+	case CHART_MEM:
+		return L"Used " + Format::Gb(g_memTotalBytes - g_memAvailBytes)
+			+ L" / " + Format::Gb(g_memTotalBytes)
+			+ L"  (Available " + Format::Gb(g_memAvailBytes) + L")";
+	case CHART_DISK:
+		_snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%c:  Used %s / %s  (Free %s)",
+		             g_systemDriveLetter,
+		             Format::Gb(g_diskTotalBytes - g_diskFreeBytes).c_str(),
+		             Format::Gb(g_diskTotalBytes).c_str(),
+		             Format::Gb(g_diskFreeBytes).c_str());
+		return buf;
+	case CHART_NET:
+		return L"Scale " + Format::Rate(g_netMaxSeen) + L" (peak seen)";
+	case CHART_GPU:
+		if (!g_gpuAvailable) return g_gpuName.empty() ? L"GPU counters unavailable" : g_gpuName;
+		return g_gpuName.empty() ? L"Busiest engine" : g_gpuName;
+	case CHART_HANDLES:
+		return L"Total system handles";
+	default:
+		return L"";
+	}
 }
 
 static void RenderPerfCharts(const HWND hWnd, const HDC hdc)
@@ -288,6 +403,14 @@ static void RenderPerfCharts(const HWND hWnd, const HDC hdc)
 	const int chartH = totalH / rows - spacing;
 	if (chartW < Dpi::Scale(50) || chartH < Dpi::Scale(30)) return;
 
+	const int textMargin = Dpi::Scale(Layout::ChartTextMargin);
+	const int textTop = Dpi::Scale(Layout::ChartTextTop);
+	const int textBottom = Dpi::Scale(Layout::ChartTextBottom);
+	const int valRightMargin = Dpi::Scale(Layout::ChartValueRightMargin);
+	const int detailBottom = Dpi::Scale(Layout::ChartDetailBottom);
+
+	SetBkMode(hdc, TRANSPARENT);
+
 	for (int i = 0; i < NUM_CHARTS; i++)
 	{
 		const int col = i % cols, row = i / cols;
@@ -300,66 +423,23 @@ static void RenderPerfCharts(const HWND hWnd, const HDC hdc)
 		g_charts[i].Render();
 		g_charts[i].Paint(hdc, x, y);
 
-		const int textMargin = Dpi::Scale(Layout::ChartTextMargin);
-		const int textTop = Dpi::Scale(Layout::ChartTextTop);
-		const int textBottom = Dpi::Scale(Layout::ChartTextBottom);
-		const int valRightMargin = Dpi::Scale(Layout::ChartValueRightMargin);
-
-		SetBkMode(hdc, TRANSPARENT);
 		SelectObject(hdc, g_hFontChart);
 		SetTextColor(hdc, RGB(200, 200, 200));
-		RECT textRc = {x + textMargin, y + textTop, x + chartW - spacing, y + textBottom};
-		DrawTextExt(hdc, g_chartTitles[i], -1, textRc, TextAlign::Left);
+		const RECT titleRc = {x + textMargin, y + textTop, x + chartW - spacing, y + textBottom};
+		DrawTextExt(hdc, g_chartTitles[i], -1, titleRc, TextAlign::Left);
 
-		WCHAR valStr[64];
-		const float latest = g_chartData[i].empty() ? 0.f : g_chartData[i].back();
-		if (i == 5) // Handles: show count
-			_snwprintf_s(valStr, _countof(valStr), _TRUNCATE, L"%d", static_cast<int>(g_rawHandleCount));
-		else
-			_snwprintf_s(valStr, _countof(valStr), _TRUNCATE, L"%.1f%%", latest);
+		const std::wstring value = ChartValueText(i);
 		SetTextColor(hdc, RGB(255, 255, 255));
-		RECT valRc = {x + chartW - valRightMargin, y + textTop, x + chartW - textMargin, y + textBottom};
-		DrawTextExt(hdc, valStr, -1, valRc, TextAlign::Right);
+		const RECT valRc = {x + chartW - valRightMargin, y + textTop, x + chartW - textMargin, y + textBottom};
+		DrawTextExt(hdc, value.c_str(), -1, valRc, TextAlign::Right);
 
-		// Detail line for CPU, memory, disk, GPU and handles
-		if (i == 0 || i == 1 || i == 2 || i == 4 || i == 5)
+		const std::wstring detail = ChartDetailText(i);
+		if (!detail.empty())
 		{
-			const int detailBottom = Dpi::Scale(Layout::ChartDetailBottom);
 			SelectObject(hdc, g_hFont);
 			SetTextColor(hdc, RGB(160, 160, 160));
-			WCHAR detail[160] = {};
-			if (i == 0)
-			{
-				const double ghz = g_cpuMhz / 1000.0;
-				if (!g_cpuName.empty())
-					_snwprintf_s(detail, _countof(detail), _TRUNCATE,
-								 L"%s  (%u cores @ %.2f GHz)",
-								 g_cpuName.c_str(), g_cpuLogicalCores, ghz);
-				else
-					_snwprintf_s(detail, _countof(detail), _TRUNCATE,
-								 L"%u logical cores @ %.2f GHz", g_cpuLogicalCores, ghz);
-			}
-			else if (i == 1)
-				_snwprintf_s(detail, _countof(detail), _TRUNCATE, L"Used %s / %s  (Available %s)",
-							 Format::Gb(g_memTotalBytes - g_memAvailBytes).c_str(),
-							 Format::Gb(g_memTotalBytes).c_str(),
-							 Format::Gb(g_memAvailBytes).c_str());
-			else if (i == 2)
-			{
-				_snwprintf_s(detail, _countof(detail), _TRUNCATE,
-							 L"%c:  Used %s / %s  (Free %s)",
-							 g_systemDriveLetter,
-							 Format::Gb(g_diskTotalBytes - g_diskFreeBytes).c_str(),
-							 Format::Gb(g_diskTotalBytes).c_str(),
-							 Format::Gb(g_diskFreeBytes).c_str());
-			}
-			else if (i == 4)
-				_snwprintf_s(detail, _countof(detail), _TRUNCATE, L"%s",
-							 g_gpuName.empty() ? L"GPU" : g_gpuName.c_str());
-			else
-				_snwprintf_s(detail, _countof(detail), _TRUNCATE, L"Total system handles");
-			RECT detRc = {x + textMargin, y + textBottom, x + chartW - spacing, y + detailBottom};
-			DrawTextExt(hdc, detail, -1, detRc, TextAlign::Left);
+			const RECT detRc = {x + textMargin, y + textBottom, x + chartW - spacing, y + detailBottom};
+			DrawTextExt(hdc, detail.c_str(), -1, detRc, TextAlign::Left | TextAlign::Ellipsis);
 		}
 	}
 }
@@ -407,6 +487,18 @@ static std::vector<ProcessInfo> g_processes;
 
 static void UpdateProcessButtons();
 static void UpdateWindowButtons();
+static void RefreshModuleList(DWORD pid);
+static void ShowWindowProperties();
+
+// Rows carry their model index in item data, so sorting the list cannot
+// desynchronise the view from the backing vector.
+static int SelectedModelIndex(const CustomListView& list, const size_t modelSize)
+{
+	const int sel = list.GetSelected();
+	if (sel < 0) return -1;
+	const auto idx = static_cast<int>(list.GetItemData(sel));
+	return (idx >= 0 && idx < static_cast<int>(modelSize)) ? idx : -1;
+}
 
 static bool MatchesFilter(const std::wstring& text)
 {
@@ -419,10 +511,21 @@ static void SetFilterText(const std::wstring& s)
 	g_filterText = s;
 }
 
+// Empty-state text that distinguishes "nothing here" from "nothing matched".
+static const WCHAR* EmptyListText()
+{
+	return g_filterText.empty() ? L"Empty" : L"No matching items";
+}
+
 static void RefreshProcessList()
 {
+	// Remember the selection by PID so filtering and refreshing don't lose the user's place.
+	const int prevIdx = SelectedModelIndex(g_procList, g_processes.size());
+	const DWORD prevPid = prevIdx >= 0 ? g_processes[prevIdx].pid : 0;
+
 	g_procList.SetRedraw(false);
 	g_procList.DeleteAllItems();
+	g_procList.SetEmptyText(EmptyListText());
 	g_processes.clear();
 
 	const HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -445,8 +548,9 @@ static void RefreshProcessList()
 			pi.name = pe.szExeFile;
 			pi.workingSet = 0;
 
-			const HANDLE hProc = OpenProcess(
-				PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
+			// PROCESS_QUERY_LIMITED_INFORMATION alone is enough for both calls below and
+			// succeeds against far more processes than adding PROCESS_VM_READ would.
+			const HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
 			if (hProc)
 			{
 				PROCESS_MEMORY_COUNTERS pmc = {};
@@ -472,7 +576,7 @@ static void RefreshProcessList()
 	{
 		auto& pi = g_processes[i];
 		const int idx = g_procList.AddItem(pi.name.c_str());
-		g_procList.SetItemData(idx, pi.pid);
+		g_procList.SetItemData(idx, i);
 		g_procList.SetItemText(idx, 1, Format::U(pi.pid));
 
 		WCHAR memStr[32];
@@ -482,9 +586,28 @@ static void RefreshProcessList()
 
 	g_procList.SetRedraw(true);
 
-	// Selection cleared by DeleteAllItems; clear dependent panel and buttons.
-	g_moduleList.DeleteAllItems();
-	g_moduleList.Invalidate();
+	// Restore the previous selection if that process still exists and still matches.
+	int restoredPid = 0;
+	if (prevPid != 0)
+	{
+		for (int i = 0; i < static_cast<int>(g_processes.size()); i++)
+			if (g_processes[i].pid == prevPid)
+			{
+				const int row = g_procList.FindItemByData(i);
+				if (row >= 0) { g_procList.SetSelected(row); restoredPid = prevPid; }
+				break;
+			}
+	}
+
+	if (restoredPid != 0)
+	{
+		RefreshModuleList(restoredPid);
+	}
+	else
+	{
+		g_moduleList.DeleteAllItems();
+		g_moduleList.Invalidate();
+	}
 	UpdateProcessButtons();
 }
 
@@ -496,9 +619,11 @@ static void RefreshModuleList(const DWORD pid)
 	const HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
 	if (hSnap == INVALID_HANDLE_VALUE)
 	{
+		g_moduleList.SetEmptyText(L"Modules unavailable (access denied)");
 		g_moduleList.SetRedraw(true);
 		return;
 	}
+	g_moduleList.SetEmptyText(L"Empty");
 
 	MODULEENTRY32W me = {sizeof(me)};
 	if (Module32FirstW(hSnap, &me))
@@ -527,11 +652,17 @@ static void ShowInExplorer(const WCHAR* path)
 
 static void KillSelectedProcess()
 {
-	const int sel = g_procList.GetSelected();
-	if (sel < 0) return;
-	const DWORD pid = static_cast<DWORD>(g_procList.GetItemData(sel));
-	if (!ConfirmAction(g_hMainWnd, L"Terminate this process?")) return;
-	const HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+	const int idx = SelectedModelIndex(g_procList, g_processes.size());
+	if (idx < 0) return;
+	const ProcessInfo& pi = g_processes[idx];
+
+	WCHAR prompt[MAX_PATH + 64];
+	_snwprintf_s(prompt, _countof(prompt), _TRUNCATE,
+	             L"Terminate %s (PID %u)?\n\nUnsaved work in this process will be lost.",
+	             pi.name.c_str(), pi.pid);
+	if (!ConfirmAction(g_hMainWnd, prompt)) return;
+
+	const HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pi.pid);
 	if (hProc)
 	{
 		const BOOL ok = TerminateProcess(hProc, 1);
@@ -547,15 +678,22 @@ static void KillSelectedProcess()
 	}
 }
 
+static void ShowSelectedProcessInExplorer()
+{
+	const int idx = SelectedModelIndex(g_procList, g_processes.size());
+	if (idx >= 0 && !g_processes[idx].path.empty())
+		ShowInExplorer(g_processes[idx].path.c_str());
+}
+
 static void OnProcessContextMenu(const HWND hWnd, const int x, const int y)
 {
-	const int sel = g_procList.GetSelected();
-	if (sel < 0) return;
-	const UINT cmd = RunPopupMenu(hWnd, x, y, {{1, L"Show in Explorer"}, {2, L"Kill Process"}});
-	if (cmd == 1 && sel < static_cast<int>(g_processes.size()) && !g_processes[sel].path.empty())
-		ShowInExplorer(g_processes[sel].path.c_str());
-	else if (cmd == 2)
-		KillSelectedProcess();
+	const int idx = SelectedModelIndex(g_procList, g_processes.size());
+	if (idx < 0) return;
+	const bool hasPath = !g_processes[idx].path.empty();
+	const UINT cmd = RunPopupMenu(hWnd, x, y,
+	                              {{1, L"Show in Explorer", hasPath}, {2, L"Kill Process"}});
+	if (cmd == 1) ShowSelectedProcessInExplorer();
+	else if (cmd == 2) KillSelectedProcess();
 }
 
 static void OnModuleContextMenu(const HWND hWnd, const int x, const int y)
@@ -591,58 +729,137 @@ static const WCHAR* TcpStateStr(const DWORD state)
 	}
 }
 
-static void FormatAddr(DWORD ip, const DWORD port, WCHAR* buf, const int bufLen)
+static void FormatAddr(const int family, const void* addr, const DWORD port, const DWORD scopeId,
+                       WCHAR* buf, const size_t bufLen)
 {
+	WCHAR ip[INET6_ADDRSTRLEN] = {};
+	if (!InetNtopW(family, addr, ip, _countof(ip)))
+		wcscpy_s(ip, L"?");
 	const WORD p = ntohs(static_cast<WORD>(port));
-	const auto b = reinterpret_cast<BYTE*>(&ip);
-	_snwprintf_s(buf, bufLen, _TRUNCATE, L"%u.%u.%u.%u:%u", b[0], b[1], b[2], b[3], p);
+	if (family == AF_INET6 && scopeId != 0)
+		_snwprintf_s(buf, bufLen, _TRUNCATE, L"[%s%%%u]:%u", ip, scopeId, p);
+	else if (family == AF_INET6)
+		_snwprintf_s(buf, bufLen, _TRUNCATE, L"[%s]:%u", ip, p);
+	else
+		_snwprintf_s(buf, bufLen, _TRUNCATE, L"%s:%u", ip, p);
+}
+
+// pid -> image name, sorted by pid for binary search.
+struct PidName
+{
+	DWORD pid;
+	std::wstring name;
+};
+
+static std::vector<PidName> SnapshotPidNames()
+{
+	std::vector<PidName> names;
+	const HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (hSnap == INVALID_HANDLE_VALUE) return names;
+	PROCESSENTRY32W pe = {sizeof(pe)};
+	if (Process32FirstW(hSnap, &pe))
+		do { names.push_back({pe.th32ProcessID, pe.szExeFile}); }
+		while (Process32NextW(hSnap, &pe));
+	CloseHandle(hSnap);
+	std::sort(names.begin(), names.end(), [](const PidName& a, const PidName& b) { return a.pid < b.pid; });
+	return names;
+}
+
+static std::wstring LookupPidName(const std::vector<PidName>& names, const DWORD pid)
+{
+	const auto it = std::lower_bound(names.begin(), names.end(), pid,
+	                                 [](const PidName& a, const DWORD p) { return a.pid < p; });
+	return (it != names.end() && it->pid == pid) ? it->name : std::wstring();
 }
 
 static void RefreshNetworkList()
 {
 	g_netList.SetRedraw(false);
 	g_netList.DeleteAllItems();
+	g_netList.SetEmptyText(EmptyListText());
 
-	auto* tcpTable = QueryExtTable<MIB_TCPTABLE_OWNER_PID>(
-		[](void* buf, ULONG* sz)
-		{
-			return GetExtendedTcpTable(buf, sz, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-		});
-	if (tcpTable)
+	const std::vector<PidName> pidNames = SnapshotPidNames();
+
+	// Adds a row only when it matches the current filter.
+	auto addRow = [&](const WCHAR* proto, const WCHAR* local, const WCHAR* remote,
+	                  const WCHAR* state, const DWORD pid)
 	{
-		for (DWORD i = 0; i < tcpTable->dwNumEntries; i++)
+		const std::wstring owner = LookupPidName(pidNames, pid);
+		const std::wstring pidStr = Format::U(pid);
+		if (!MatchesFilter(std::wstring(proto) + L" " + local + L" " + remote + L" " +
+			state + L" " + pidStr + L" " + owner))
+			return;
+		const int idx = g_netList.AddItem(proto);
+		g_netList.SetItemText(idx, 1, local);
+		g_netList.SetItemText(idx, 2, remote);
+		g_netList.SetItemText(idx, 3, state);
+		g_netList.SetItemText(idx, 4, pidStr);
+		g_netList.SetItemText(idx, 5, owner);
+	};
+
+	WCHAR local[80], remote[80];
+
+	auto* tcp4 = QueryExtTable<MIB_TCPTABLE_OWNER_PID>([](void* buf, ULONG* sz)
+	{
+		return GetExtendedTcpTable(buf, sz, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+	});
+	if (tcp4)
+	{
+		for (DWORD i = 0; i < tcp4->dwNumEntries; i++)
 		{
-			const auto& row = tcpTable->table[i];
-			WCHAR local[64], remote[64];
-			FormatAddr(row.dwLocalAddr, row.dwLocalPort, local, _countof(local));
-			FormatAddr(row.dwRemoteAddr, row.dwRemotePort, remote, _countof(remote));
-			const int idx = g_netList.AddItem(L"TCP");
-			g_netList.SetItemText(idx, 1, local);
-			g_netList.SetItemText(idx, 2, remote);
-			g_netList.SetItemText(idx, 3, TcpStateStr(row.dwState));
-			g_netList.SetItemText(idx, 4, Format::U(row.dwOwningPid));
+			const auto& row = tcp4->table[i];
+			FormatAddr(AF_INET, &row.dwLocalAddr, row.dwLocalPort, 0, local, _countof(local));
+			FormatAddr(AF_INET, &row.dwRemoteAddr, row.dwRemotePort, 0, remote, _countof(remote));
+			addRow(L"TCP", local, remote, TcpStateStr(row.dwState), row.dwOwningPid);
 		}
 	}
-	FreeExtTable(tcpTable);
+	FreeExtTable(tcp4);
 
-	auto* udpTable = QueryExtTable<MIB_UDPTABLE_OWNER_PID>(
-		[](void* buf, ULONG* sz)
-		{
-			return GetExtendedUdpTable(buf, sz, TRUE, AF_INET, UDP_TABLE_OWNER_PID, 0);
-		});
-	if (udpTable)
+	auto* tcp6 = QueryExtTable<MIB_TCP6TABLE_OWNER_PID>([](void* buf, ULONG* sz)
 	{
-		for (DWORD i = 0; i < udpTable->dwNumEntries; i++)
+		return GetExtendedTcpTable(buf, sz, TRUE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
+	});
+	if (tcp6)
+	{
+		for (DWORD i = 0; i < tcp6->dwNumEntries; i++)
 		{
-			const auto& row = udpTable->table[i];
-			WCHAR local[64];
-			FormatAddr(row.dwLocalAddr, row.dwLocalPort, local, _countof(local));
-			const int idx = g_netList.AddItem(L"UDP");
-			g_netList.SetItemText(idx, 1, local);
-			g_netList.SetItemText(idx, 4, Format::U(row.dwOwningPid));
+			const auto& row = tcp6->table[i];
+			FormatAddr(AF_INET6, row.ucLocalAddr, row.dwLocalPort, row.dwLocalScopeId, local, _countof(local));
+			FormatAddr(AF_INET6, row.ucRemoteAddr, row.dwRemotePort, row.dwRemoteScopeId, remote, _countof(remote));
+			addRow(L"TCPv6", local, remote, TcpStateStr(row.dwState), row.dwOwningPid);
 		}
 	}
-	FreeExtTable(udpTable);
+	FreeExtTable(tcp6);
+
+	auto* udp4 = QueryExtTable<MIB_UDPTABLE_OWNER_PID>([](void* buf, ULONG* sz)
+	{
+		return GetExtendedUdpTable(buf, sz, TRUE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+	});
+	if (udp4)
+	{
+		for (DWORD i = 0; i < udp4->dwNumEntries; i++)
+		{
+			const auto& row = udp4->table[i];
+			FormatAddr(AF_INET, &row.dwLocalAddr, row.dwLocalPort, 0, local, _countof(local));
+			addRow(L"UDP", local, L"*:*", L"", row.dwOwningPid);
+		}
+	}
+	FreeExtTable(udp4);
+
+	auto* udp6 = QueryExtTable<MIB_UDP6TABLE_OWNER_PID>([](void* buf, ULONG* sz)
+	{
+		return GetExtendedUdpTable(buf, sz, TRUE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
+	});
+	if (udp6)
+	{
+		for (DWORD i = 0; i < udp6->dwNumEntries; i++)
+		{
+			const auto& row = udp6->table[i];
+			FormatAddr(AF_INET6, row.ucLocalAddr, row.dwLocalPort, row.dwLocalScopeId, local, _countof(local));
+			addRow(L"UDPv6", local, L"*:*", L"", row.dwOwningPid);
+		}
+	}
+	FreeExtTable(udp6);
 
 	g_netList.SetRedraw(true);
 }
@@ -687,8 +904,13 @@ static BOOL CALLBACK EnumWindowsForList(const HWND hwnd, const LPARAM lParam)
 
 static void RefreshWindowList()
 {
+	// Remember the selection by window handle across refreshes.
+	const int prevIdx = SelectedModelIndex(g_winList, g_windows.size());
+	const HWND prevHwnd = prevIdx >= 0 ? g_windows[prevIdx].hwnd : nullptr;
+
 	g_winList.SetRedraw(false);
 	g_winList.DeleteAllItems();
+	g_winList.SetEmptyText(EmptyListText());
 	g_windows.clear();
 	EnumWindows(EnumWindowsForList, reinterpret_cast<LPARAM>(&g_windows));
 
@@ -696,6 +918,7 @@ static void RefreshWindowList()
 	{
 		auto& wi = g_windows[i];
 		const int idx = g_winList.AddItem(wi.title.empty() ? wi.className.c_str() : wi.title.c_str());
+		g_winList.SetItemData(idx, i);
 		g_winList.SetItemText(idx, 1, wi.className.c_str());
 		g_winList.SetItemText(idx, 2, Format::U(wi.pid));
 		g_winList.SetItemText(idx, 3, Format::Ptr(wi.hwnd));
@@ -703,21 +926,32 @@ static void RefreshWindowList()
 
 	g_winList.SetRedraw(true);
 
-	g_winPropList.DeleteAllItems();
-	g_winPropList.Invalidate();
+	if (prevHwnd)
+	{
+		for (int i = 0; i < static_cast<int>(g_windows.size()); i++)
+			if (g_windows[i].hwnd == prevHwnd)
+			{
+				const int row = g_winList.FindItemByData(i);
+				if (row >= 0) g_winList.SetSelected(row);
+				break;
+			}
+	}
+
+	ShowWindowProperties();
 	UpdateWindowButtons();
 }
 
-static void ShowWindowProperties(const int selIdx)
+static void ShowWindowProperties()
 {
 	g_winPropList.SetRedraw(false);
 	g_winPropList.DeleteAllItems();
-	if (selIdx < 0 || selIdx >= static_cast<int>(g_windows.size()))
+	const int idx = SelectedModelIndex(g_winList, g_windows.size());
+	if (idx < 0)
 	{
 		g_winPropList.SetRedraw(true);
 		return;
 	}
-	auto& wi = g_windows[selIdx];
+	auto& wi = g_windows[idx];
 
 	auto addProp = [](const WCHAR* name, const std::wstring& value)
 	{
@@ -734,6 +968,9 @@ static void ShowWindowProperties(const int selIdx)
 	_snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d, %d, %d, %d", wi.rect.left, wi.rect.top, wi.rect.right,
 	             wi.rect.bottom);
 	addProp(L"Rect", buf);
+	_snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%d \u00D7 %d",
+	             wi.rect.right - wi.rect.left, wi.rect.bottom - wi.rect.top);
+	addProp(L"Size", buf);
 	addProp(L"Style", Format::Hex32(static_cast<unsigned>(GetWindowLong(wi.hwnd, GWL_STYLE))));
 	addProp(L"ExStyle", Format::Hex32(static_cast<unsigned>(GetWindowLong(wi.hwnd, GWL_EXSTYLE))));
 
@@ -833,19 +1070,16 @@ static void CopyAboutInfoToClipboard()
 	if (!OpenClipboard(g_hMainWnd)) return;
 	EmptyClipboard();
 	const size_t bytes = (text.size() + 1) * sizeof(WCHAR);
-	const HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-	if (hMem)
+	if (const HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes))
 	{
+		bool owned = false;
 		if (auto* dst = static_cast<WCHAR*>(GlobalLock(hMem)))
 		{
 			memcpy(dst, text.c_str(), bytes);
 			GlobalUnlock(hMem);
-			SetClipboardData(CF_UNICODETEXT, hMem);
+			owned = SetClipboardData(CF_UNICODETEXT, hMem) != nullptr;
 		}
-		else
-		{
-			GlobalFree(hMem);
-		}
+		if (!owned) GlobalFree(hMem); // clipboard only takes ownership on success
 	}
 	CloseClipboard();
 }
@@ -903,47 +1137,54 @@ static void DrawDarkButton(const DRAWITEMSTRUCT* dis)
 
 static void UpdateProcessButtons()
 {
-	const int sel = g_procList.GetSelected();
-	const bool hasSel = sel >= 0 && sel < static_cast<int>(g_processes.size());
-	EnableWindow(g_btnExplorerProc, hasSel && !g_processes[sel].path.empty());
-	EnableWindow(g_btnKillProc, hasSel);
+	const int idx = SelectedModelIndex(g_procList, g_processes.size());
+	EnableWindow(g_btnExplorerProc, idx >= 0 && !g_processes[idx].path.empty());
+	EnableWindow(g_btnKillProc, idx >= 0);
 }
 
 static void UpdateWindowButtons()
 {
-	const int sel = g_winList.GetSelected();
-	const bool hasSel = sel >= 0 && sel < static_cast<int>(g_windows.size());
+	const bool hasSel = SelectedModelIndex(g_winList, g_windows.size()) >= 0;
 	EnableWindow(g_btnExplorerWin, hasSel);
 	EnableWindow(g_btnKillWin, hasSel);
 }
 
 static void ShowWindowProcessInExplorer()
 {
-	const int sel = g_winList.GetSelected();
-	if (sel < 0 || sel >= static_cast<int>(g_windows.size())) return;
-	const HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, g_windows[sel].pid);
-	if (hProc)
+	const int idx = SelectedModelIndex(g_winList, g_windows.size());
+	if (idx < 0) return;
+	const HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, g_windows[idx].pid);
+	if (!hProc)
 	{
-		WCHAR path[MAX_PATH] = {};
-		DWORD len = MAX_PATH;
-		if (QueryFullProcessImageNameW(hProc, 0, path, &len))
-			ShowInExplorer(path);
-		CloseHandle(hProc);
+		MessageBox(g_hMainWnd, L"Could not open the owning process.\nAccess denied?",
+			L"System Stuff", MB_OK | MB_ICONERROR);
+		return;
 	}
+	WCHAR path[MAX_PATH] = {};
+	DWORD len = MAX_PATH;
+	if (QueryFullProcessImageNameW(hProc, 0, path, &len))
+		ShowInExplorer(path);
+	CloseHandle(hProc);
 }
 
 static void KillSelectedWindow()
 {
-	const int sel = g_winList.GetSelected();
-	if (sel < 0 || sel >= static_cast<int>(g_windows.size())) return;
-	if (!ConfirmAction(g_hMainWnd, L"Close this window?")) return;
-	PostMessage(g_windows[sel].hwnd, WM_CLOSE, 0, 0);
+	const int idx = SelectedModelIndex(g_winList, g_windows.size());
+	if (idx < 0) return;
+	const WindowInfo& wi = g_windows[idx];
+
+	WCHAR prompt[320];
+	_snwprintf_s(prompt, _countof(prompt), _TRUNCATE, L"Close \"%s\"?",
+	             wi.title.empty() ? wi.className.c_str() : wi.title.c_str());
+	if (!ConfirmAction(g_hMainWnd, prompt)) return;
+	PostMessage(wi.hwnd, WM_CLOSE, 0, 0);
 	// Don't refresh immediately: WM_CLOSE is async and may be cancelled.
 	// User can hit F5 / Refresh to see the result.
 }
 
 // Sync About panel's VScroll geometry from the current client rect.
-// contentH is computed during paint and persists between calls.
+// Content height is derived from the row count so the scrollbar is correct on
+// the very first paint, before any drawing has happened.
 static void SyncAboutScroll(HWND hWnd)
 {
 	RECT rc;
@@ -954,6 +1195,15 @@ static void SyncAboutScroll(HWND hWnd)
 	g_aboutScroll.trackBottom = rc.bottom;
 	g_aboutScroll.sbX = rc.right - sbW;
 	g_aboutScroll.sbRight = rc.right;
+
+	EnsureAboutRows();
+	const int headerH = Dpi::Scale(Layout::AboutTitleSpacing)
+		+ Dpi::Scale(Layout::AboutSubtitleSpacing)
+		+ Dpi::Scale(Layout::AboutPostCopyrightSpacing)
+		+ Dpi::Scale(Layout::AboutPostSepSpacing);
+	g_aboutScroll.contentH = Dpi::Scale(Layout::AboutTopMargin) * 2 + headerH
+		+ static_cast<int>(g_aboutRows.size()) * Dpi::Scale(Layout::AboutRowSpacing);
+	g_aboutScroll.Clamp();
 }
 
 static LRESULT CALLBACK AboutPanelProc(const HWND hWnd, const UINT msg, const WPARAM wParam, const LPARAM lParam)
@@ -979,10 +1229,13 @@ static LRESULT CALLBACK AboutPanelProc(const HWND hWnd, const UINT msg, const WP
 			const int iconSize = Dpi::Scale(Layout::AboutIconSize);
 			const int textLeft = leftMargin + iconSize + Dpi::Scale(Layout::AboutIconGap);
 			static HICON s_hAboutIcon = nullptr;
-			if (!s_hAboutIcon)
+			static int s_aboutIconSize = 0;
+			if (!s_hAboutIcon || s_aboutIconSize != iconSize)
 			{
+				if (s_hAboutIcon) DestroyIcon(s_hAboutIcon);
 				s_hAboutIcon = static_cast<HICON>(LoadImageW(g_hInst, MAKEINTRESOURCEW(IDI_LIGHT),
 					IMAGE_ICON, iconSize, iconSize, LR_DEFAULTCOLOR));
+				s_aboutIconSize = iconSize;
 			}
 			if (s_hAboutIcon)
 			{
@@ -1041,26 +1294,19 @@ static LRESULT CALLBACK AboutPanelProc(const HWND hWnd, const UINT msg, const WP
 			for (const auto& r : rows)
 				drawRow(r.first.c_str(), r.second.c_str());
 
-			// Total content height (in unscrolled coordinates).
-			// `y` ends as scrolled coord of the next row top, so add scrollPos to convert
-			// back to unscrolled, plus a bottom margin matching the top.
-			g_aboutScroll.contentH = (y + g_aboutScroll.pos) + Dpi::Scale(Layout::AboutTopMargin);
-
-			// Clamp scroll if content shrank (do NOT invalidate from inside paint).
-			g_aboutScroll.Clamp();
-
 			g_aboutScroll.Draw(memDC);
 			return 0;
 		}
 	case WM_ERASEBKGND: return 1;
 
+	case WM_GETDLGCODE: return DLGC_WANTARROWS;
+
 	case WM_MOUSEWHEEL:
 		{
 			SyncAboutScroll(hWnd);
-			const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-			g_aboutScroll.pos -= delta / 3;
-			g_aboutScroll.Clamp();
-			InvalidateRect(hWnd, nullptr, FALSE);
+			if (g_aboutScroll.OnMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam),
+			                               Dpi::Scale(Layout::AboutRowSpacing)))
+				InvalidateRect(hWnd, nullptr, FALSE);
 			return 0;
 		}
 
@@ -1153,7 +1399,8 @@ static void LayoutTabPages()
 	const int btnY = barY + (barH - btnH) / 2;
 
 	// Filter edit
-	const bool needsFilter = (g_nCurrentTab == TAB_PROCESSES || g_nCurrentTab == TAB_WINDOWS);
+	const bool needsFilter = (g_nCurrentTab == TAB_PROCESSES || g_nCurrentTab == TAB_NETWORK ||
+		g_nCurrentTab == TAB_WINDOWS);
 	ShowWindow(g_hFilterEdit, (hasBottomBar && needsFilter) ? SW_SHOW : SW_HIDE);
 	if (hasBottomBar && needsFilter)
 	{
@@ -1250,27 +1497,6 @@ static void LayoutTabPages()
 	}
 }
 
-static void SwitchTab(const int newTab)
-{
-	if (newTab < 0 || newTab >= TAB_COUNT) return;
-
-	// Save current tab's filter text
-	WCHAR buf[256] = {};
-	GetWindowTextW(g_hFilterEdit, buf, _countof(buf));
-	g_tabFilterText[g_nCurrentTab] = buf;
-
-	if (g_hTabPages[g_nCurrentTab]) ShowWindow(g_hTabPages[g_nCurrentTab], SW_HIDE);
-	g_nCurrentTab = newTab;
-	if (g_hTabPages[g_nCurrentTab]) ShowWindow(g_hTabPages[g_nCurrentTab], SW_SHOW);
-	g_tabCtrl.SetCurSel(g_nCurrentTab);
-
-	// Restore new tab's filter text
-	SetFilterText(g_tabFilterText[g_nCurrentTab]);
-	SetWindowTextW(g_hFilterEdit, g_filterText.c_str());
-
-	LayoutTabPages();
-}
-
 static void RefreshCurrentView()
 {
 	switch (g_nCurrentTab)
@@ -1288,23 +1514,93 @@ static void RefreshCurrentView()
 	}
 }
 
+static void SwitchTab(const int newTab)
+{
+	if (newTab < 0 || newTab >= TAB_COUNT || newTab == g_nCurrentTab) return;
+
+	// Save current tab's filter text
+	WCHAR buf[256] = {};
+	GetWindowTextW(g_hFilterEdit, buf, _countof(buf));
+	g_tabFilterText[g_nCurrentTab] = buf;
+
+	if (g_hTabPages[g_nCurrentTab]) ShowWindow(g_hTabPages[g_nCurrentTab], SW_HIDE);
+	g_nCurrentTab = newTab;
+	if (g_hTabPages[g_nCurrentTab]) ShowWindow(g_hTabPages[g_nCurrentTab], SW_SHOW);
+	g_tabCtrl.SetCurSel(g_nCurrentTab);
+
+	// Restore new tab's filter text
+	SetFilterText(g_tabFilterText[g_nCurrentTab]);
+	g_updatingFilterEdit = true;
+	SetWindowTextW(g_hFilterEdit, g_filterText.c_str());
+	g_updatingFilterEdit = false;
+
+	LayoutTabPages();
+
+	// Snapshots go stale while a tab is hidden, so re-collect on activation.
+	RefreshCurrentView();
+}
+
 // ============================================================
 // Main window
 // ============================================================
+static void CreateAppFonts()
+{
+	g_hFont         = MakeUiFont(13, FW_NORMAL);
+	g_hFontBold     = MakeUiFont(13, FW_BOLD);
+	g_hFontChart    = MakeUiFont(20, FW_BOLD);
+	g_hFontTitle    = MakeUiFont(32, FW_BOLD);
+	g_hFontSubtitle = MakeUiFont(18, FW_NORMAL);
+}
+
+static void DestroyAppFonts()
+{
+	for (HFONT* f : {&g_hFont, &g_hFontBold, &g_hFontChart, &g_hFontTitle, &g_hFontSubtitle})
+	{
+		if (*f) DeleteObject(*f);
+		*f = nullptr;
+	}
+}
+
+// Re-scales every cached metric after the window moves to a monitor with a different DPI.
+static void OnDpiChanged(const HWND hWnd, const UINT newDpi, const RECT* suggested)
+{
+	const float oldScale = Dpi::g_scale;
+	Dpi::g_scale = newDpi / 96.0f;
+	const float ratio = (oldScale > 0) ? Dpi::g_scale / oldScale : 1.0f;
+
+	// Hand the new fonts to every control before destroying the old ones, so nothing
+	// can paint with a deleted HFONT in between.
+	HFONT old[] = {g_hFont, g_hFontBold, g_hFontChart, g_hFontTitle, g_hFontSubtitle};
+	CreateAppFonts();
+
+	g_tabCtrl.SetHeight(Dpi::Scale(Layout::TabHeight));
+	g_tabCtrl.SetFont(g_hFont);
+	for (CustomListView* lv : {&g_procList, &g_moduleList, &g_netList, &g_winList, &g_winPropList})
+		lv->OnDpiChanged(g_hFont, g_hFontBold, ratio);
+
+	for (const HWND ctl : {g_btnRefreshProc, g_btnExplorerProc, g_btnKillProc, g_btnRefreshNet,
+		     g_btnRefreshWin, g_btnExplorerWin, g_btnKillWin, g_btnRefreshAbout,
+		     g_btnCopyAbout, g_btnReportIssue, g_hFilterEdit})
+		if (ctl) SendMessage(ctl, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFont), TRUE);
+
+	SetWindowPos(hWnd, nullptr, suggested->left, suggested->top,
+	             suggested->right - suggested->left, suggested->bottom - suggested->top,
+	             SWP_NOZORDER | SWP_NOACTIVATE);
+	InvalidateRect(hWnd, nullptr, TRUE);
+
+	for (const HFONT f : old)
+		if (f) DeleteObject(f);
+}
+
 static LRESULT CALLBACK MainWndProc(const HWND hWnd, const UINT msg, const WPARAM wParam, const LPARAM lParam)
 {
 	switch (msg)
 	{
 	case WM_CREATE:
 		{
-			// Initialize DPI scaling
+			g_hMainWnd = hWnd;
 			Dpi::g_scale = GetDpiForWindow(hWnd) / 96.0f;
-
-			g_hFont         = MakeUiFont(13, FW_NORMAL);
-			g_hFontBold     = MakeUiFont(13, FW_BOLD);
-			g_hFontChart    = MakeUiFont(20, FW_BOLD);
-			g_hFontTitle    = MakeUiFont(32, FW_BOLD);
-			g_hFontSubtitle = MakeUiFont(18, FW_NORMAL);
+			CreateAppFonts();
 
 			// Custom tab control
 			g_tabCtrl.Create(hWnd, g_hInst, Dpi::Scale(Layout::TabHeight), g_hFont);
@@ -1314,8 +1610,9 @@ static LRESULT CALLBACK MainWndProc(const HWND hWnd, const UINT msg, const WPARA
 
 			RegisterSimpleClass(g_hInst, L"SystemStuffTabPage", TabPageProc);
 
+			// WS_EX_CONTROLPARENT lets IsDialogMessage tab into the lists on each page.
 			for (int i = 0; i < TAB_COUNT; i++)
-				g_hTabPages[i] = CreateWindowEx(0, L"SystemStuffTabPage", L"",
+				g_hTabPages[i] = CreateWindowEx(WS_EX_CONTROLPARENT, L"SystemStuffTabPage", L"",
 				                                WS_CHILD | WS_CLIPCHILDREN, 0, 0, 100, 100, hWnd, nullptr, g_hInst,
 				                                nullptr);
 
@@ -1332,10 +1629,12 @@ static LRESULT CALLBACK MainWndProc(const HWND hWnd, const UINT msg, const WPARA
 			g_procList.AddColumn(L"Name", 200);
 			g_procList.AddColumn(L"PID", 70);
 			g_procList.AddColumn(L"Memory", 100);
-			g_procList.SetSelectionCallback([](const int idx)
+			g_procList.SetSelectionCallback([](const int row)
 			{
-				const DWORD pid = static_cast<DWORD>(g_procList.GetItemData(idx));
-				RefreshModuleList(pid);
+				const int idx = SelectedModelIndex(g_procList, g_processes.size());
+				if (idx >= 0) RefreshModuleList(g_processes[idx].pid);
+				else g_moduleList.DeleteAllItems();
+				(void)row;
 				UpdateProcessButtons();
 			});
 			g_procList.SetContextMenuCallback([](const HWND hw, const int x, const int y)
@@ -1358,10 +1657,11 @@ static LRESULT CALLBACK MainWndProc(const HWND hWnd, const UINT msg, const WPARA
 			// Network list
 			g_netList.Create(g_hTabPages[TAB_NETWORK], g_hInst, g_hFont, g_hFontBold);
 			g_netList.AddColumn(L"Proto", 60);
-			g_netList.AddColumn(L"Local Address", 180);
-			g_netList.AddColumn(L"Remote Address", 180);
+			g_netList.AddColumn(L"Local Address", 190);
+			g_netList.AddColumn(L"Remote Address", 190);
 			g_netList.AddColumn(L"State", 110);
 			g_netList.AddColumn(L"PID", 70);
+			g_netList.AddColumn(L"Process", 160);
 
 			// Windows list
 			g_winList.Create(g_hTabPages[TAB_WINDOWS], g_hInst, g_hFont, g_hFontBold);
@@ -1369,9 +1669,9 @@ static LRESULT CALLBACK MainWndProc(const HWND hWnd, const UINT msg, const WPARA
 			g_winList.AddColumn(L"Class", 150);
 			g_winList.AddColumn(L"PID", 70);
 			g_winList.AddColumn(L"Handle", 80);
-			g_winList.SetSelectionCallback([](const int idx)
+			g_winList.SetSelectionCallback([](int)
 			{
-				ShowWindowProperties(idx);
+				ShowWindowProperties();
 				UpdateWindowButtons();
 			});
 
@@ -1383,7 +1683,7 @@ static LRESULT CALLBACK MainWndProc(const HWND hWnd, const UINT msg, const WPARA
 			// About panel
 			RegisterSimpleClass(g_hInst, L"SystemStuffAboutPanel", AboutPanelProc);
 			g_hAboutPanel = CreateWindowEx(0, L"SystemStuffAboutPanel", L"",
-			                               WS_CHILD | WS_VISIBLE, 0, 0, 100, 100,
+			                               WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 100, 100,
 			                               g_hTabPages[TAB_ABOUT], nullptr, g_hInst, nullptr);
 
 			// Create buttons (owner-draw, parented to main window for bottom bar)
@@ -1392,7 +1692,7 @@ static LRESULT CALLBACK MainWndProc(const HWND hWnd, const UINT msg, const WPARA
 			auto makeBtn = [&](const int id, const WCHAR* text) -> HWND
 			{
 				const HWND btn = CreateWindowEx(0, L"BUTTON", text,
-				                                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+				                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
 				                                0, 0, btnW, btnH, hWnd,
 				                                (HMENU)static_cast<INT_PTR>(id), g_hInst, nullptr);
 				SendMessage(btn, WM_SETFONT, (WPARAM)g_hFont, 0);
@@ -1418,9 +1718,9 @@ static LRESULT CALLBACK MainWndProc(const HWND hWnd, const UINT msg, const WPARA
 			g_btnReportIssue = makeBtn(BTN_REPORT_ISSUE, L"Report an Issue");
 
 			g_hFilterEdit = CreateWindowEx(0, L"EDIT", L"",
-			                               WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+			                               WS_CHILD | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
 			                               0, 0, Dpi::Scale(Layout::FilterWidth), btnH,
-			                               hWnd, (HMENU)9999, g_hInst, nullptr);
+			                               hWnd, (HMENU)ID_FILTER_EDIT, g_hInst, nullptr);
 			SendMessage(g_hFilterEdit, WM_SETFONT, (WPARAM)g_hFont, 0);
 			SendMessage(g_hFilterEdit, EM_SETCUEBANNER, 0, (LPARAM)L"Filter...");
 			SetWindowTheme(g_hFilterEdit, L"", L"");
@@ -1438,10 +1738,7 @@ static LRESULT CALLBACK MainWndProc(const HWND hWnd, const UINT msg, const WPARA
 			for (int i = 0; i < TAB_COUNT; i++)
 				ShowWindow(g_hTabPages[i], i == g_nCurrentTab ? SW_SHOW : SW_HIDE);
 
-			RefreshProcessList();
-			RefreshNetworkList();
-			RefreshWindowList();
-			RefreshAboutInfo();
+			// The other tabs snapshot lazily when first activated, so startup stays fast.
 			return 0;
 		}
 
@@ -1453,6 +1750,19 @@ static LRESULT CALLBACK MainWndProc(const HWND hWnd, const UINT msg, const WPARA
 			LayoutTabPages();
 			return 0;
 		}
+
+	case WM_GETMINMAXINFO:
+		{
+			// Below this the charts stop rendering and the button bar overlaps the filter.
+			auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+			mmi->ptMinTrackSize.x = Dpi::Scale(Layout::MinWindowWidth);
+			mmi->ptMinTrackSize.y = Dpi::Scale(Layout::MinWindowHeight);
+			return 0;
+		}
+
+	case WM_DPICHANGED:
+		OnDpiChanged(hWnd, HIWORD(wParam), reinterpret_cast<const RECT*>(lParam));
+		return 0;
 
 	case WM_CTLCOLOREDIT:
 		return Dark::OnCtlColorEdit((HDC)wParam);
@@ -1478,27 +1788,35 @@ static LRESULT CALLBACK MainWndProc(const HWND hWnd, const UINT msg, const WPARA
 		}
 
 	case WM_COMMAND:
-		if (HIWORD(wParam) == EN_CHANGE && LOWORD(wParam) == 9999)
+		if (HIWORD(wParam) == EN_CHANGE && LOWORD(wParam) == ID_FILTER_EDIT)
 		{
+			if (g_updatingFilterEdit) return 0;
 			WCHAR buf[256] = {};
 			GetWindowTextW(g_hFilterEdit, buf, _countof(buf));
 			SetFilterText(buf);
 			g_tabFilterText[g_nCurrentTab] = g_filterText;
-			if (g_nCurrentTab == TAB_PROCESSES) RefreshProcessList();
-			else if (g_nCurrentTab == TAB_WINDOWS) RefreshWindowList();
+			RefreshCurrentView();
 			return 0;
 		}
 		switch (LOWORD(wParam))
 		{
+		case IDM_REFRESH: RefreshCurrentView();
+			return 0;
+		case IDM_NEXT_TAB: SwitchTab((g_nCurrentTab + 1) % TAB_COUNT);
+			return 0;
+		case IDM_PREV_TAB: SwitchTab((g_nCurrentTab + TAB_COUNT - 1) % TAB_COUNT);
+			return 0;
+		case IDM_FOCUS_FILTER:
+			if (IsWindowVisible(g_hFilterEdit))
+			{
+				SetFocus(g_hFilterEdit);
+				SendMessage(g_hFilterEdit, EM_SETSEL, 0, -1);
+			}
+			return 0;
 		case BTN_REFRESH_PROC: RefreshProcessList();
 			return 0;
-		case BTN_EXPLORER_PROC:
-			{
-				const int sel = g_procList.GetSelected();
-				if (sel >= 0 && sel < static_cast<int>(g_processes.size()) && !g_processes[sel].path.empty())
-					ShowInExplorer(g_processes[sel].path.c_str());
-				return 0;
-			}
+		case BTN_EXPLORER_PROC: ShowSelectedProcessInExplorer();
+			return 0;
 		case BTN_KILL_PROC: KillSelectedProcess();
 			return 0;
 		case BTN_REFRESH_NET: RefreshNetworkList();
@@ -1517,23 +1835,18 @@ static LRESULT CALLBACK MainWndProc(const HWND hWnd, const UINT msg, const WPARA
 			ShellExecuteW(hWnd, L"open", L"https://github.com/ZacWalk/system-stuff/issues",
 			              nullptr, nullptr, SW_SHOWNORMAL);
 			return 0;
-		}
-		break;
-
-	case WM_KEYDOWN:
-		if (wParam == VK_F5)
-		{
-			RefreshCurrentView();
-			return 0;
+		default:
+			if (LOWORD(wParam) >= IDM_TAB_FIRST && LOWORD(wParam) < IDM_TAB_FIRST + TAB_COUNT)
+			{
+				SwitchTab(LOWORD(wParam) - IDM_TAB_FIRST);
+				return 0;
+			}
+			break;
 		}
 		break;
 
 	case WM_DESTROY:
-		if (g_hFont) DeleteObject(g_hFont);
-		if (g_hFontBold) DeleteObject(g_hFontBold);
-		if (g_hFontChart) DeleteObject(g_hFontChart);
-		if (g_hFontTitle) DeleteObject(g_hFontTitle);
-		if (g_hFontSubtitle) DeleteObject(g_hFontSubtitle);
+		DestroyAppFonts();
 		UnregisterApplicationRestart();
 		PostQuitMessage(0);
 		return 0;
@@ -1572,19 +1885,21 @@ int WINAPI wWinMain(const HINSTANCE hInstance, HINSTANCE, LPWSTR, const int nCmd
 	                            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
 	                            CW_USEDEFAULT, CW_USEDEFAULT, 1000, 650,
 	                            nullptr, nullptr, hInstance, nullptr);
+	if (!g_hMainWnd) return 1;
 
 	ShowWindow(g_hMainWnd, nCmdShow);
 	UpdateWindow(g_hMainWnd);
 
 	const HACCEL hAccel = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDR_ACCEL));
-	MSG msg;
-	while (GetMessage(&msg, nullptr, 0, 0))
+	MSG msg = {};
+	for (;;)
 	{
-		if (!TranslateAccelerator(g_hMainWnd, hAccel, &msg))
-		{
-			TranslateMessage(&msg);
-			DispatchMessage(&msg);
-		}
+		const BOOL got = GetMessage(&msg, nullptr, 0, 0);
+		if (got == 0 || got == -1) break; // WM_QUIT, or an unrecoverable queue error
+		if (TranslateAccelerator(g_hMainWnd, hAccel, &msg)) continue;
+		if (IsDialogMessage(g_hMainWnd, &msg)) continue; // Tab / Shift+Tab navigation
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
 	}
 	CoUninitialize();
 	return static_cast<int>(msg.wParam);

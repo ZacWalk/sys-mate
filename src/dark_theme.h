@@ -17,6 +17,9 @@ namespace Dark
 	constexpr COLORREF TextSel = RGB(255, 255, 255);
 	constexpr COLORREF Border = RGB(60, 60, 65);
 	constexpr COLORREF Splitter = RGB(55, 55, 60);
+	constexpr COLORREF BgScrollTrack = RGB(35, 35, 38);
+	constexpr COLORREF BgScrollThumb = RGB(80, 80, 85);
+	constexpr COLORREF Accent = RGB(0, 150, 255);
 
 	inline HBRUSH BrushWindow()
 	{
@@ -57,6 +60,18 @@ namespace Dark
 	inline HBRUSH BrushHeader()
 	{
 		static HBRUSH b = CreateSolidBrush(BgHeader);
+		return b;
+	}
+
+	inline HBRUSH BrushScrollTrack()
+	{
+		static HBRUSH b = CreateSolidBrush(BgScrollTrack);
+		return b;
+	}
+
+	inline HBRUSH BrushScrollThumb()
+	{
+		static HBRUSH b = CreateSolidBrush(BgScrollThumb);
 		return b;
 	}
 
