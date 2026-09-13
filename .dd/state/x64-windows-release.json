@@ -1,0 +1,15 @@
+{
+  "manifestHash": "045BA4B529BC0EC40F20495D462A2113C7DD006BE8C2A673FDDF5597EF2C5FF7",
+  "mapping": {
+    "configure": "release",
+    "test": "release",
+    "build": "release"
+  },
+  "directory": "C:\\code\\apps\\system-stuff\\build\\release",
+  "generator": "Ninja",
+  "multiConfig": false,
+  "files": {
+    "C:\\code\\apps\\system-stuff\\CMakePresets.json": "0481D9FF83B50D33D851DCB28EB79E0B61AC7FFC9B4A301C15D07B0615EC353E"
+  },
+  "root": "C:\\code\\apps\\system-stuff"
+}
