@@ -25,16 +25,18 @@ The whole app is one translation unit: `src/main.cpp` plus header-only helpers.
 
 ## Build
 
-- **Toolset**: MSVC v145 (Visual Studio 2022 17.14+ / Visual Studio 2026)
+- **Toolset**: MSVC v145 (Visual Studio 2022 17.14+ / Visual Studio 2026), driven
+  over CMake and Ninja by the vendored dd driver (`dd.ps1`, PowerShell 7.4+)
 - **Language**: C++17, Unicode, `/W4` clean
-- **Platforms**: Win32, x64
-- **Preferred**: `.\dd.ps1 run` (builds Release x64 and launches; stops a running
-  instance first, since the linker fails with access denied otherwise)
-- **Direct**: `msbuild src\sys-stuff.vcxproj /p:Configuration=Debug /p:Platform=x64`
+- **Platform**: x64 only
+- **Build**: `.\dd.ps1 build` for Debug and Release, or `.\dd.ps1 build release`
+- **Run**: `.\dd.ps1 launch` builds Release and starts the app. Close a running
+  instance first — the linker cannot overwrite an executable that is in use
+- **Test**: `.\dd.ps1 test --label system-stuff` builds both configurations and runs
+  CTest. The only test is a build smoke check; there is no headless suite, so a UI
+  change has to be checked by running the app
 - **No precompiled headers** — each file includes only what it needs
-- Output goes to `exe\`. `OutDir` uses `$(ProjectDir)..\` deliberately: `$(SolutionDir)`
-  is undefined when building the `.vcxproj` directly, which silently split output
-  between `exe\` and `src\exe\` and left stale binaries behind.
+- Output goes to `exe\`: `sys-stuff-64.exe`, and `sys-stuff-64d.exe` for Debug
 
 ## Conventions
 

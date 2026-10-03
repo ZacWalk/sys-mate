@@ -41,7 +41,7 @@ runtime locates Visual Studio and uses the CMake and Ninja that ship with it.
 ```powershell
 .\dd.ps1 build        # both configurations
 .\dd.ps1 test         # build and run the suite
-.\dd.ps1 run          # build, then launch
+.\dd.ps1 launch       # build Release, then start the app
 ```
 
 Binaries land in `exe\` as `sys-stuff-64.exe`, with a `d` suffix for Debug.
