@@ -4,3 +4,4 @@ exe/
 
 # CMake / Ninja build output
 build/
+/.dd/state/
