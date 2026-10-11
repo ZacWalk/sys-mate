@@ -25,9 +25,9 @@ Way back around 2000, the company I worked for still supported Windows 95 and 98
 - **About** — OS build, architecture, processor, GPU, RAM, system drive and
   uptime, copyable to the clipboard in one action.
 
-Every list sorts by clicking a column header, filters as you type, and is fully
-keyboard accessible. The UI is per-monitor DPI aware and rescales when dragged
-between monitors.
+Every list sorts by clicking a column header, filters as you type on the text of
+any column, and is fully keyboard accessible. The UI is per-monitor DPI aware and
+rescales when dragged between monitors.
 
 <kbd>F5</kbd> refreshes, <kbd>Ctrl</kbd>+<kbd>F</kbd> focuses the filter box, and
 <kbd>Ctrl</kbd>+<kbd>1</kbd>–<kbd>5</kbd> jump between tabs.
