@@ -33,10 +33,22 @@ The whole app is one translation unit: `src/main.cpp` plus header-only helpers.
 - **Run**: `.\dd.ps1 launch` builds Release and starts the app. Close a running
   instance first — the linker cannot overwrite an executable that is in use
 - **Test**: `.\dd.ps1 test --label system-stuff` builds both configurations and runs
-  CTest. The only test is a build smoke check; there is no headless suite, so a UI
-  change has to be checked by running the app
+  CTest: a build smoke check and `tests/sort.cpp`, which checks the list sort order
+  (`Sort::CompareCells` in `src/helpers.h`) is a strict weak ordering. There is no
+  headless UI suite, so a UI change has to be checked by running the app
 - **No precompiled headers** — each file includes only what it needs
-- Output goes to `exe\`: `sys-stuff-64.exe`, and `sys-stuff-64d.exe` for Debug
+- **Compiler and linker settings** in `CMakeLists.txt` carry over the Visual Studio
+  project's: `/permissive-` and `/sdl` (the SDL security checks, their warnings as
+  errors) in both configurations, and whole-program optimisation in Release through
+  `INTERPROCEDURAL_OPTIMIZATION_RELEASE` — `/GL` on the compile, `/LTCG` on the
+  link. Its `/Gy` and `/Oi` come with CMake's `/O2`; its Release PDB was not carried
+  over. A setting in `CMakeLists.txt` is not evidence that it reached the tools;
+  read `FLAGS` and `LINK_FLAGS` for `sys-stuff` in `build\release\build.ninja` and
+  `build\debug\build.ninja`
+- Output goes to `exe\`: `sys-stuff-64.exe`, and `sys-stuff-64d.exe` for Debug.
+  Release links the CRT statically (`MSVC_RUNTIME_LIBRARY` in `CMakeLists.txt`), so
+  `sys-stuff-64.exe` runs without the VC++ redistributable; check its imports with
+  `dumpbin /dependents` after touching the build
 
 ## Conventions
 

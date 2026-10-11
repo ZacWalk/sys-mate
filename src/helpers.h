@@ -1,6 +1,8 @@
 #pragma once
 #include <windows.h>
 #include <windowsx.h>
+#include <cmath>
+#include <cwchar>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -272,6 +274,13 @@ namespace Format
 		return buf;
 	}
 
+	inline std::wstring Mb(ULONGLONG bytes)
+	{
+		WCHAR buf[32];
+		_snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%.1f MB", bytes / (1024.0 * 1024.0));
+		return buf;
+	}
+
 	inline std::wstring Ghz(DWORD mhz)
 	{
 		WCHAR buf[32];
@@ -318,6 +327,36 @@ namespace Format
 		WCHAR buf[20];
 		_snwprintf_s(buf, _countof(buf), _TRUNCATE, L"%p", p);
 		return buf;
+	}
+}
+
+// ============================================================
+// List sorting
+// ============================================================
+namespace Sort
+{
+	// Numeric-aware cell compare, so PIDs and sizes sort by magnitude, not lexically.
+	// A cell that starts with a finite number sorts by that number, ahead of every
+	// cell that does not; the rest sort as text. Each cell is classified on its own,
+	// never by what it is compared with, so this is a strict weak ordering whatever a
+	// column holds, as std::sort requires. ("nan-..." would otherwise read as NaN,
+	// which compares neither less nor greater, and a sort in Debug asserts.)
+	inline int CompareCells(const std::wstring& a, const std::wstring& b)
+	{
+		const auto leadingNumber = [](const std::wstring& s, double& value)
+		{
+			WCHAR* end = nullptr;
+			value = wcstod(s.c_str(), &end);
+			return end != s.c_str() && std::isfinite(value);
+		};
+
+		double na = 0.0;
+		double nb = 0.0;
+		const bool numA = leadingNumber(a, na);
+		const bool numB = leadingNumber(b, nb);
+		if (numA != numB) return numA ? -1 : 1;
+		if (numA && na != nb) return na < nb ? -1 : 1;
+		return _wcsicmp(a.c_str(), b.c_str());
 	}
 }
 

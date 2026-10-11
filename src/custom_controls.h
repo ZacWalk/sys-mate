@@ -327,6 +327,9 @@ public:
 			InvalidateRect(hWnd, nullptr, FALSE);
 			return 0;
 
+		// The class has CS_DBLCLKS, so the second of two quick clicks arrives as a
+		// double-click; it is still a click (re-sort, page, select), not a no-op.
+		case WM_LBUTTONDBLCLK:
 		case WM_LBUTTONDOWN:
 		{
 			SetFocus(hWnd);
@@ -528,18 +531,6 @@ private:
 		if (m_onSelect) m_onSelect(row);
 	}
 
-	// Numeric-aware cell compare so PIDs and sizes sort by magnitude, not lexically.
-	static int CompareCell(const std::wstring& a, const std::wstring& b)
-	{
-		WCHAR* endA = nullptr;
-		WCHAR* endB = nullptr;
-		const double na = wcstod(a.c_str(), &endA);
-		const double nb = wcstod(b.c_str(), &endB);
-		if (endA != a.c_str() && endB != b.c_str() && na != nb)
-			return na < nb ? -1 : 1;
-		return _wcsicmp(a.c_str(), b.c_str());
-	}
-
 	void ApplySort()
 	{
 		if (m_sortCol < 0 || m_rows.size() < 2) return;
@@ -558,7 +549,7 @@ private:
 		{
 			const std::wstring& ca = col < (int)m_rows[a].size() ? m_rows[a][col] : m_empty;
 			const std::wstring& cb = col < (int)m_rows[b].size() ? m_rows[b][col] : m_empty;
-			const int cmp = CompareCell(ca, cb);
+			const int cmp = Sort::CompareCells(ca, cb);
 			return asc ? cmp < 0 : cmp > 0;
 		});
 

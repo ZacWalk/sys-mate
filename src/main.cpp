@@ -481,6 +481,9 @@ struct ProcessInfo
 	std::wstring name;
 	std::wstring path;
 	SIZE_T workingSet;
+	// Creation time (FILETIME ticks), 0 if it could not be read. A PID is reused once its
+	// process exits, so a PID plus this identifies the process the row describes.
+	ULONGLONG created = 0;
 };
 
 static std::vector<ProcessInfo> g_processes;
@@ -504,6 +507,14 @@ static bool MatchesFilter(const std::wstring& text)
 {
 	if (g_filterText.empty()) return true;
 	return StrStrIW(text.c_str(), g_filterText.c_str()) != nullptr;
+}
+
+// Creation time in FILETIME ticks, or 0 when the handle lacks query rights.
+static ULONGLONG ProcessCreationTime(const HANDLE hProc)
+{
+	FILETIME created = {}, exited = {}, kernel = {}, user = {};
+	if (!GetProcessTimes(hProc, &created, &exited, &kernel, &user)) return 0;
+	return (static_cast<ULONGLONG>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
 }
 
 static void SetFilterText(const std::wstring& s)
@@ -541,7 +552,6 @@ static void RefreshProcessList()
 		do
 		{
 			if (pe.th32ProcessID == 0) continue;
-			if (!MatchesFilter(pe.szExeFile)) continue;
 
 			ProcessInfo pi;
 			pi.pid = pe.th32ProcessID;
@@ -560,8 +570,14 @@ static void RefreshProcessList()
 				DWORD pathLen = MAX_PATH;
 				if (QueryFullProcessImageNameW(hProc, 0, path, &pathLen))
 					pi.path = path;
+				pi.created = ProcessCreationTime(hProc);
 				CloseHandle(hProc);
 			}
+
+			// Match every column the list shows, as the Network tab does, so typing a
+			// PID or a memory figure finds the row as well as a name does.
+			if (!MatchesFilter(pi.name + L" " + Format::U(pi.pid) + L" " + Format::Mb(pi.workingSet)))
+				continue;
 
 			g_processes.push_back(std::move(pi));
 		}
@@ -578,10 +594,7 @@ static void RefreshProcessList()
 		const int idx = g_procList.AddItem(pi.name.c_str());
 		g_procList.SetItemData(idx, i);
 		g_procList.SetItemText(idx, 1, Format::U(pi.pid));
-
-		WCHAR memStr[32];
-		_snwprintf_s(memStr, _countof(memStr), _TRUNCATE, L"%.1f MB", pi.workingSet / (1024.0 * 1024.0));
-		g_procList.SetItemText(idx, 2, memStr);
+		g_procList.SetItemText(idx, 2, Format::Mb(pi.workingSet));
 	}
 
 	g_procList.SetRedraw(true);
@@ -655,27 +668,47 @@ static void KillSelectedProcess()
 	const int idx = SelectedModelIndex(g_procList, g_processes.size());
 	if (idx < 0) return;
 	const ProcessInfo& pi = g_processes[idx];
+	const DWORD pid = pi.pid;
+	const ULONGLONG created = pi.created;
 
 	WCHAR prompt[MAX_PATH + 64];
 	_snwprintf_s(prompt, _countof(prompt), _TRUNCATE,
 	             L"Terminate %s (PID %u)?\n\nUnsaved work in this process will be lost.",
-	             pi.name.c_str(), pi.pid);
+	             pi.name.c_str(), pid);
 	if (!ConfirmAction(g_hMainWnd, prompt)) return;
 
-	const HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pi.pid);
-	if (hProc)
+	// The list is a snapshot: the process may have exited since, and Windows reuses the
+	// PID of an exited process. Terminate only the process the user confirmed, which the
+	// PID and its creation time identify together.
+	const HANDLE hProc = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!hProc)
 	{
-		const BOOL ok = TerminateProcess(hProc, 1);
+		const bool gone = GetLastError() == ERROR_INVALID_PARAMETER;
+		MessageBox(g_hMainWnd, gone
+			           ? L"The process has already exited."
+			           : L"Could not open process for termination.\nAccess denied?",
+		           L"System Stuff", gone ? MB_OK | MB_ICONINFORMATION : MB_OK | MB_ICONERROR);
+		if (gone) RefreshProcessList();
+		return;
+	}
+
+	DWORD exitCode = 0;
+	const bool running = GetExitCodeProcess(hProc, &exitCode) && exitCode == STILL_ACTIVE;
+	const bool same = created != 0 && ProcessCreationTime(hProc) == created;
+	if (!running || !same)
+	{
 		CloseHandle(hProc);
-		if (!ok)
-			MessageBox(g_hMainWnd, L"Failed to terminate process.", L"System Stuff", MB_OK | MB_ICONERROR);
+		MessageBox(g_hMainWnd, L"The process has exited since the list was refreshed.\n\nNothing was terminated.",
+		           L"System Stuff", MB_OK | MB_ICONINFORMATION);
 		RefreshProcessList();
+		return;
 	}
-	else
-	{
-		MessageBox(g_hMainWnd, L"Could not open process for termination.\nAccess denied?",
-			L"System Stuff", MB_OK | MB_ICONERROR);
-	}
+
+	const BOOL ok = TerminateProcess(hProc, 1);
+	CloseHandle(hProc);
+	if (!ok)
+		MessageBox(g_hMainWnd, L"Failed to terminate process.", L"System Stuff", MB_OK | MB_ICONERROR);
+	RefreshProcessList();
 }
 
 static void ShowSelectedProcessInExplorer()
@@ -895,7 +928,10 @@ static BOOL CALLBACK EnumWindowsForList(const HWND hwnd, const LPARAM lParam)
 	wi.tid = GetWindowThreadProcessId(hwnd, &wi.pid);
 	GetWindowRect(hwnd, &wi.rect);
 
-	if (!MatchesFilter(wi.title + L" " + wi.className)) return TRUE;
+	// Match every column the list shows, as the Network tab does.
+	if (!MatchesFilter(wi.title + L" " + wi.className + L" " + Format::U(wi.pid) + L" " +
+		Format::Ptr(wi.hwnd)))
+		return TRUE;
 
 	auto* vec = reinterpret_cast<std::vector<WindowInfo>*>(lParam);
 	vec->push_back(std::move(wi));
@@ -1135,18 +1171,27 @@ static void DrawDarkButton(const DRAWITEMSTRUCT* dis)
 	DrawTextExt(hdc, text, -1, rc, TextAlign::Center | TextAlign::VCenter);
 }
 
+// Disabling the control that has the keyboard focus leaves no focus at all, and then
+// no key reaches any control (after Kill Process empties the selection, say). Hand the
+// focus to the page's list first.
+static void EnableButton(const HWND btn, const bool enable, const HWND fallback)
+{
+	if (!enable && GetFocus() == btn) SetFocus(fallback);
+	EnableWindow(btn, enable);
+}
+
 static void UpdateProcessButtons()
 {
 	const int idx = SelectedModelIndex(g_procList, g_processes.size());
-	EnableWindow(g_btnExplorerProc, idx >= 0 && !g_processes[idx].path.empty());
-	EnableWindow(g_btnKillProc, idx >= 0);
+	EnableButton(g_btnExplorerProc, idx >= 0 && !g_processes[idx].path.empty(), g_procList.GetHWND());
+	EnableButton(g_btnKillProc, idx >= 0, g_procList.GetHWND());
 }
 
 static void UpdateWindowButtons()
 {
 	const bool hasSel = SelectedModelIndex(g_winList, g_windows.size()) >= 0;
-	EnableWindow(g_btnExplorerWin, hasSel);
-	EnableWindow(g_btnKillWin, hasSel);
+	EnableButton(g_btnExplorerWin, hasSel, g_winList.GetHWND());
+	EnableButton(g_btnKillWin, hasSel, g_winList.GetHWND());
 }
 
 static void ShowWindowProcessInExplorer()
@@ -1172,12 +1217,26 @@ static void KillSelectedWindow()
 	const int idx = SelectedModelIndex(g_winList, g_windows.size());
 	if (idx < 0) return;
 	const WindowInfo& wi = g_windows[idx];
+	const HWND hwnd = wi.hwnd;
+	const DWORD pid = wi.pid;
+	const DWORD tid = wi.tid;
 
 	WCHAR prompt[320];
 	_snwprintf_s(prompt, _countof(prompt), _TRUNCATE, L"Close \"%s\"?",
 	             wi.title.empty() ? wi.className.c_str() : wi.title.c_str());
 	if (!ConfirmAction(g_hMainWnd, prompt)) return;
-	PostMessage(wi.hwnd, WM_CLOSE, 0, 0);
+
+	// The list is a snapshot: the window may have closed since, and a handle value can
+	// then be reused. Post only to the window the user confirmed.
+	DWORD nowPid = 0;
+	if (!IsWindow(hwnd) || GetWindowThreadProcessId(hwnd, &nowPid) != tid || nowPid != pid)
+	{
+		MessageBox(g_hMainWnd, L"The window has closed since the list was refreshed.\n\nNothing was closed.",
+		           L"System Stuff", MB_OK | MB_ICONINFORMATION);
+		RefreshWindowList();
+		return;
+	}
+	PostMessage(hwnd, WM_CLOSE, 0, 0);
 	// Don't refresh immediately: WM_CLOSE is async and may be cancelled.
 	// User can hit F5 / Refresh to see the result.
 }
@@ -1398,13 +1457,28 @@ static void LayoutTabPages()
 	const int btnSpace = Dpi::Scale(Layout::ButtonSpacing);
 	const int btnY = barY + (barH - btnH) / 2;
 
-	// Filter edit
+	std::vector<HWND> tabButtons;
+	switch (g_nCurrentTab)
+	{
+	case TAB_PROCESSES: tabButtons = {g_btnRefreshProc, g_btnExplorerProc, g_btnKillProc};
+		break;
+	case TAB_NETWORK: tabButtons = {g_btnRefreshNet};
+		break;
+	case TAB_WINDOWS: tabButtons = {g_btnRefreshWin, g_btnExplorerWin, g_btnKillWin};
+		break;
+	case TAB_ABOUT: tabButtons = {g_btnReportIssue, g_btnCopyAbout, g_btnRefreshAbout};
+		break;
+	}
+	const int buttonsLeft = rc.right - static_cast<int>(tabButtons.size()) * (btnSpace + btnW);
+
+	// Filter edit: full width when there is room, but it gives way to the buttons
+	// rather than sliding underneath them in a narrow window.
 	const bool needsFilter = (g_nCurrentTab == TAB_PROCESSES || g_nCurrentTab == TAB_NETWORK ||
 		g_nCurrentTab == TAB_WINDOWS);
 	ShowWindow(g_hFilterEdit, (hasBottomBar && needsFilter) ? SW_SHOW : SW_HIDE);
 	if (hasBottomBar && needsFilter)
 	{
-		const int filterW = Dpi::Scale(Layout::FilterWidth);
+		const int filterW = std::clamp(buttonsLeft - btnSpace * 2, 0, Dpi::Scale(Layout::FilterWidth));
 		MoveWindow(g_hFilterEdit, btnSpace, btnY, filterW, btnH, TRUE);
 	}
 
@@ -1421,31 +1495,12 @@ static void LayoutTabPages()
 	hideBtn(g_btnCopyAbout);
 	hideBtn(g_btnReportIssue);
 
-	auto layoutButtons = [&](const std::vector<HWND>& btns)
+	int btnX = buttonsLeft;
+	for (const HWND btn : tabButtons)
 	{
-		int btnX = rc.right;
-		for (int i = static_cast<int>(btns.size()) - 1; i >= 0; i--)
-		{
-			btnX -= btnSpace + btnW;
-			MoveWindow(btns[i], btnX, btnY, btnW, btnH, TRUE);
-			ShowWindow(btns[i], SW_SHOW);
-		}
-	};
-
-	switch (g_nCurrentTab)
-	{
-	case TAB_PROCESSES:
-		layoutButtons({g_btnRefreshProc, g_btnExplorerProc, g_btnKillProc});
-		break;
-	case TAB_NETWORK:
-		layoutButtons({g_btnRefreshNet});
-		break;
-	case TAB_WINDOWS:
-		layoutButtons({g_btnRefreshWin, g_btnExplorerWin, g_btnKillWin});
-		break;
-	case TAB_ABOUT:
-		layoutButtons({g_btnReportIssue, g_btnCopyAbout, g_btnRefreshAbout});
-		break;
+		MoveWindow(btn, btnX, btnY, btnW, btnH, TRUE);
+		ShowWindow(btn, SW_SHOW);
+		btnX += btnSpace + btnW;
 	}
 
 	// Performance
@@ -1514,6 +1569,20 @@ static void RefreshCurrentView()
 	}
 }
 
+// Puts keyboard focus on the first control of the current tab's page that takes it,
+// or on the frame when the page has none (Performance). It reads the control's own
+// style, as GetNextDlgTabItem does, rather than IsWindowVisible: on the first
+// activation the frame may not be marked visible yet.
+static void FocusCurrentPage()
+{
+	const HWND page = g_hTabPages[g_nCurrentTab];
+	const HWND first = page ? GetNextDlgTabItem(page, nullptr, FALSE) : nullptr;
+	const LONG_PTR style = first ? GetWindowLongPtr(first, GWL_STYLE) : 0;
+	const bool usable = first && IsChild(page, first) &&
+		(style & (WS_TABSTOP | WS_VISIBLE | WS_DISABLED)) == (WS_TABSTOP | WS_VISIBLE);
+	SetFocus(usable ? first : g_hMainWnd);
+}
+
 static void SwitchTab(const int newTab)
 {
 	if (newTab < 0 || newTab >= TAB_COUNT || newTab == g_nCurrentTab) return;
@@ -1535,6 +1604,13 @@ static void SwitchTab(const int newTab)
 	g_updatingFilterEdit = false;
 
 	LayoutTabPages();
+
+	// Keyboard focus must not stay on a control that has just been hidden, or
+	// arrows, Shift+F10 and the menu key would act on another tab's list. Focus
+	// parked on the frame itself does nothing either, so both move into the page.
+	const HWND focus = GetFocus();
+	if (focus && (focus == g_hMainWnd || !IsWindowVisible(focus)))
+		FocusCurrentPage();
 
 	// Snapshots go stale while a tab is hidden, so re-collect on activation.
 	RefreshCurrentView();
@@ -1763,6 +1839,31 @@ static LRESULT CALLBACK MainWndProc(const HWND hWnd, const UINT msg, const WPARA
 	case WM_DPICHANGED:
 		OnDpiChanged(hWnd, HIWORD(wParam), reinterpret_cast<const RECT*>(lParam));
 		return 0;
+
+	case WM_ACTIVATE:
+		{
+			// Like a dialog, give focus back to the control that had it when the window
+			// was last active, and on the first activation - or when that control is
+			// gone - to the first control of the current page. DefWindowProc would park
+			// it on the frame, where no key does anything until the user clicks or tabs
+			// into a list.
+			static HWND s_lastFocus = nullptr;
+			if (LOWORD(wParam) == WA_INACTIVE)
+			{
+				const HWND focus = GetFocus();
+				s_lastFocus = (focus && IsChild(hWnd, focus)) ? focus : nullptr;
+			}
+			else if (!HIWORD(wParam))
+			{
+				if (s_lastFocus && IsWindow(s_lastFocus) && IsChild(hWnd, s_lastFocus) &&
+					IsWindowVisible(s_lastFocus))
+					SetFocus(s_lastFocus);
+				else
+					FocusCurrentPage();
+				return 0;
+			}
+			break;
+		}
 
 	case WM_CTLCOLOREDIT:
 		return Dark::OnCtlColorEdit((HDC)wParam);
