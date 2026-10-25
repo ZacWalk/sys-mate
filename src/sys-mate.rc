@@ -1,0 +1,53 @@
+#include "resource.h"
+#include <winres.h>
+
+IDI_LIGHT ICON "res\\sys-mate.ico"
+IDI_DARK  ICON "res\\sys-mate-dark.ico"
+
+IDR_ACCEL ACCELERATORS
+BEGIN
+    VK_F5,      IDM_REFRESH,        VIRTKEY, NOINVERT
+    "R",        IDM_REFRESH,        VIRTKEY, CONTROL, NOINVERT
+    "F",        IDM_FOCUS_FILTER,   VIRTKEY, CONTROL, NOINVERT
+    VK_TAB,     IDM_NEXT_TAB,       VIRTKEY, CONTROL, NOINVERT
+    VK_TAB,     IDM_PREV_TAB,       VIRTKEY, CONTROL, SHIFT, NOINVERT
+    VK_NEXT,    IDM_NEXT_TAB,       VIRTKEY, CONTROL, NOINVERT
+    VK_PRIOR,   IDM_PREV_TAB,       VIRTKEY, CONTROL, NOINVERT
+    "1",        IDM_TAB_FIRST + 0,  VIRTKEY, CONTROL, NOINVERT
+    "2",        IDM_TAB_FIRST + 1,  VIRTKEY, CONTROL, NOINVERT
+    "3",        IDM_TAB_FIRST + 2,  VIRTKEY, CONTROL, NOINVERT
+    "4",        IDM_TAB_FIRST + 3,  VIRTKEY, CONTROL, NOINVERT
+    "5",        IDM_TAB_FIRST + 4,  VIRTKEY, CONTROL, NOINVERT
+END
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 2,0,0,0
+ PRODUCTVERSION 2,0,0,0
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x1L
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS 0x4L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "SysMate - System Information Utility"
+            VALUE "FileVersion", "2.0.0.0"
+            VALUE "InternalName", "SysMate"
+            VALUE "LegalCopyright", "Copyright (C) 2002 Zac Walker"
+            VALUE "OriginalFilename", "sys-mate.exe"
+            VALUE "ProductName", "SysMate"
+            VALUE "ProductVersion", "2.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

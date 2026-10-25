@@ -1,0 +1,7 @@
+intermediate/
+exe/
+.vs/
+
+# CMake / Ninja build output
+build/
+/.dd/state/
