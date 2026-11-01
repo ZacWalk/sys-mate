@@ -1,15 +1,12 @@
 // Checks the list sort order. std::sort needs a strict weak ordering; a column whose
 // cells broke it (a process named "nan-..." next to one named "7-...") made the
 // Debug build assert "invalid comparator" and abort.
-#define NOMINMAX  // as main.cpp does, before any Windows header
-#define WIN32_LEAN_AND_MEAN
-#include "helpers.h"
-
 #include <algorithm>
 #include <crtdbg.h>
 #include <cstdio>
 #include <string>
 #include <vector>
+#include "ui_model.h"
 
 namespace
 {
@@ -24,7 +21,10 @@ namespace
 		}
 	}
 
-	bool Less(const std::wstring& a, const std::wstring& b) { return Sort::CompareCells(a, b) < 0; }
+	bool Less(const std::string& a, const std::string& b)
+	{
+		return sysmate::ui::compare_cells(a, b) < 0;
+	}
 }
 
 int main()
@@ -37,21 +37,29 @@ int main()
 	_CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
 
 	// Magnitude, not text, for the numbers the lists show.
-	Check(Less(L"9", L"10"), "9 < 10");
-	Check(Less(L"5.7 MB", L"27.0 MB"), "5.7 MB < 27.0 MB");
-	Check(Less(L"512 KB", L"2460 KB"), "512 KB < 2460 KB");
-	Check(Sort::CompareCells(L"agency.exe", L"AGENCY.EXE") == 0, "text ignores case");
+	Check(Less("9", "10"), "9 < 10");
+	Check(Less("5.7 MB", "27.0 MB"), "5.7 MB < 27.0 MB");
+	Check(Less("512 KB", "2460 KB"), "512 KB < 2460 KB");
+	Check(sysmate::ui::compare_cells("agency.exe", "AGENCY.EXE") == 0, "text ignores case");
 
-	// Names that wcstod reads as NaN or infinity are text, and the order is antisymmetric.
-	Check(Less(L"7-dummy.exe", L"nan-dummy.exe"), "7-dummy.exe < nan-dummy.exe");
-	Check(!Less(L"nan-dummy.exe", L"7-dummy.exe"), "not nan-dummy.exe < 7-dummy.exe");
-	Check(Less(L"7-dummy.exe", L"inf.exe") && !Less(L"inf.exe", L"7-dummy.exe"), "inf.exe is text");
+	// Names that parse as NaN or infinity are text, and the order is antisymmetric.
+	Check(Less("7-dummy.exe", "nan-dummy.exe"), "7-dummy.exe < nan-dummy.exe");
+	Check(!Less("nan-dummy.exe", "7-dummy.exe"), "not nan-dummy.exe < 7-dummy.exe");
+	Check(Less("7-dummy.exe", "inf.exe") && !Less("inf.exe", "7-dummy.exe"), "inf.exe is text");
+	double huge = 0.0;
+	Check(!sysmate::ui::leading_number("1e999", huge), "positive overflow is text");
+	Check(!sysmate::ui::leading_number("-1e999", huge), "negative overflow is text");
+	Check(!sysmate::ui::leading_number("1e999-dummy.exe", huge),
+	      "overflow mixed text is text");
+	Check(!sysmate::ui::leading_number("-1e999-dummy.exe", huge),
+	      "negative overflow mixed text is text");
 
-	const std::vector<std::wstring> cells = {
-		L"nan-dummy.exe", L"NaN", L"7-dummy.exe", L"inf.exe", L"-inf", L"1e999", L"0x1A", L"",
-		L"agency.exe", L"Agency.exe", L"10", L"9", L"+5", L"-1", L",", L"1 \u00D7 1", L"0, 0, 1, 1",
-		L"0.0.0.0:135", L"[::]:135", L"27.0 MB", L"5.7 MB", L"ThumbnailDeviceHelperWnd",
-		L"0000000000060064", L"0x08280088", L"LISTENING", L"TCPv6"};
+	const std::vector<std::string> cells = {
+		"nan-dummy.exe", "NaN", "7-dummy.exe", "inf.exe", "-inf", "1e999", "-1e999",
+		"1e999-dummy.exe", "-1e999-dummy.exe", "0x1A", "",
+		"agency.exe", "Agency.exe", "10", "9", "+5", "-1", ",", "1 x 1", "0, 0, 1, 1",
+		"0.0.0.0:135", "[::]:135", "27.0 MB", "5.7 MB", "ThumbnailDeviceHelperWnd",
+		"0000000000060064", "0x08280088", "LISTENING", "TCPv6"};
 
 	// Strict weak ordering over every pair and triple of the sample cells.
 	for (const auto& a : cells)
@@ -71,7 +79,7 @@ int main()
 	}
 
 	// Sort both ways, as a column header does; the Debug STL checks the comparator too.
-	std::vector<std::wstring> sorted = cells;
+	std::vector<std::string> sorted = cells;
 	std::stable_sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return Less(a, b); });
 	Check(std::is_sorted(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return Less(a, b); }),
 	      "ascending sort is ordered");

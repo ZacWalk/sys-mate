@@ -1,16 +1,21 @@
 #pragma once
-#include <windows.h>
-#include <cmath>
-#include <vector>
-#include <deque>
-#include <algorithm>
 
-// Anti-aliased chart renderer to an RGB buffer, drawn via SetDIBitsToDevice.
-// All rendering is done in software C++ with sub-pixel anti-aliasing.
+// SysMate's domain chart rasterizer.  It owns no window or device context:
+// rendering produces a top-down 32-bit bitmap that pf::draw_context displays.
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <string>
+#include <vector>
 
 struct ChartColor
 {
-	uint8_t r, g, b;
+	uint8_t r = 0;
+	uint8_t g = 0;
+	uint8_t b = 0;
+
+	bool operator==(const ChartColor&) const = default;
 };
 
 struct ChartStyle
@@ -21,164 +26,103 @@ struct ChartStyle
 	ChartColor fillColor = {0, 120, 200};
 	ChartColor textColor = {180, 180, 180};
 	ChartColor axisColor = {80, 80, 80};
-	int fillAlpha = 60; // 0-255
+	int fillAlpha = 60;
 };
 
 class Chart
 {
-public:
-	void Resize(const int w, const int h)
+	int _width = 0;
+	int _height = 0;
+	std::vector<uint32_t> _pixels;
+	std::vector<float> _data;
+	float _min_value = 0.0f;
+	float _max_value = 100.0f;
+	ChartStyle _style;
+	int _grid_margin = 8;
+
+	static constexpr uint32_t pack(const ChartColor color)
 	{
-		if (w == m_w && h == m_h && !m_pixels.empty()) return;
-		m_w = w;
-		m_h = h;
-		// BMP rows are bottom-up, each row padded to 4 bytes
-		m_stride = ((w * 3 + 3) & ~3);
-		m_pixels.assign(static_cast<size_t>(m_stride) * h, 0);
+		return static_cast<uint32_t>(color.r) |
+			(static_cast<uint32_t>(color.g) << 8) |
+			(static_cast<uint32_t>(color.b) << 16) | 0xff000000u;
 	}
 
-	template <class Container>
-	void SetData(const Container& data, const float minVal = 0.f, const float maxVal = 100.f)
-	{
-		m_data.assign(data.begin(), data.end());
-		m_minVal = minVal;
-		m_maxVal = maxVal;
-	}
-
-	void SetStyle(const ChartStyle& s) { m_style = s; }
-	void SetTitle(const wchar_t* t) { m_title = t ? t : L""; }
-	void SetMargin(const int m) { m_gridMargin = m; }
-
-	void Render()
-	{
-		if (m_w <= 0 || m_h <= 0) return;
-		Fill(m_style.background);
-		DrawGrid();
-		if (!m_data.empty())
-		{
-			DrawFilledArea();
-			DrawLine();
-		}
-	}
-
-	void Paint(const HDC hdc, const int x, const int y) const
-	{
-		if (m_w <= 0 || m_h <= 0) return;
-		BITMAPINFO bmi = {};
-		bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-		bmi.bmiHeader.biWidth = m_w;
-		bmi.bmiHeader.biHeight = m_h; // positive = bottom-up
-		bmi.bmiHeader.biPlanes = 1;
-		bmi.bmiHeader.biBitCount = 24;
-		bmi.bmiHeader.biCompression = BI_RGB;
-		SetDIBitsToDevice(hdc, x, y, m_w, m_h,
-		                  0, 0, 0, m_h, m_pixels.data(), &bmi, DIB_RGB_COLORS);
-	}
-
-	int Width() const { return m_w; }
-	int Height() const { return m_h; }
-	const std::wstring& Title() const { return m_title; }
-
-private:
-	int m_w = 0, m_h = 0, m_stride = 0;
-	std::vector<uint8_t> m_pixels;
-	std::vector<float> m_data;
-	float m_minVal = 0, m_maxVal = 100;
-	ChartStyle m_style;
-	std::wstring m_title;
-	int m_gridMargin = 8;
-
-	// Set pixel (bottom-up bitmap: row 0 is bottom)
-	void SetPixel(const int x, const int y, const ChartColor c)
-	{
-		if (x < 0 || x >= m_w || y < 0 || y >= m_h) return;
-		const int row = m_h - 1 - y; // flip to bottom-up
-		const int off = row * m_stride + x * 3;
-		m_pixels[off + 0] = c.b;
-		m_pixels[off + 1] = c.g;
-		m_pixels[off + 2] = c.r;
-	}
-
-	ChartColor GetPixel(const int x, const int y) const
-	{
-		if (x < 0 || x >= m_w || y < 0 || y >= m_h) return {0, 0, 0};
-		const int row = m_h - 1 - y;
-		const int off = row * m_stride + x * 3;
-		return {m_pixels[off + 2], m_pixels[off + 1], m_pixels[off + 0]};
-	}
-
-	static ChartColor Blend(const ChartColor dst, const ChartColor src, const int alpha)
+	static ChartColor unpack(const uint32_t color)
 	{
 		return {
-			static_cast<uint8_t>((src.r * alpha + dst.r * (255 - alpha)) / 255),
-			static_cast<uint8_t>((src.g * alpha + dst.g * (255 - alpha)) / 255),
-			static_cast<uint8_t>((src.b * alpha + dst.b * (255 - alpha)) / 255)
-		};
+			static_cast<uint8_t>(color & 0xff),
+			static_cast<uint8_t>((color >> 8) & 0xff),
+			static_cast<uint8_t>((color >> 16) & 0xff)};
 	}
 
-	void SetPixelAA(const int x, const int y, const ChartColor c, const float alpha)
+	void set_pixel(const int x, const int y, const ChartColor color)
 	{
-		if (x < 0 || x >= m_w || y < 0 || y >= m_h) return;
-		const int a = static_cast<int>(alpha * 255);
-		if (a <= 0) return;
-		if (a >= 255)
+		if (x < 0 || x >= _width || y < 0 || y >= _height) return;
+		_pixels[static_cast<size_t>(y) * _width + x] = pack(color);
+	}
+
+	[[nodiscard]] ChartColor get_pixel(const int x, const int y) const
+	{
+		if (x < 0 || x >= _width || y < 0 || y >= _height) return {};
+		return unpack(_pixels[static_cast<size_t>(y) * _width + x]);
+	}
+
+	static ChartColor blend(const ChartColor destination, const ChartColor source, const int alpha)
+	{
+		return {
+			static_cast<uint8_t>((source.r * alpha + destination.r * (255 - alpha)) / 255),
+			static_cast<uint8_t>((source.g * alpha + destination.g * (255 - alpha)) / 255),
+			static_cast<uint8_t>((source.b * alpha + destination.b * (255 - alpha)) / 255)};
+	}
+
+	void set_pixel_aa(const int x, const int y, const ChartColor color, const float alpha)
+	{
+		if (alpha <= 0.0f) return;
+		if (alpha >= 1.0f)
 		{
-			SetPixel(x, y, c);
+			set_pixel(x, y, color);
 			return;
 		}
-		const auto bg = GetPixel(x, y);
-		SetPixel(x, y, Blend(bg, c, a));
+		set_pixel(x, y, blend(get_pixel(x, y), color,
+		                     static_cast<int>(alpha * 255.0f)));
 	}
 
-	void Fill(const ChartColor c)
+	void fill(const ChartColor color)
 	{
-		for (int y = 0; y < m_h; y++)
-		{
-			const int row = m_h - 1 - y;
-			int off = row * m_stride;
-			for (int x = 0; x < m_w; x++)
-			{
-				m_pixels[off + 0] = c.b;
-				m_pixels[off + 1] = c.g;
-				m_pixels[off + 2] = c.r;
-				off += 3;
-			}
-		}
+		std::fill(_pixels.begin(), _pixels.end(), pack(color));
 	}
 
-	void DrawGrid()
+	void draw_grid()
 	{
-		const int margin = m_gridMargin;
-		// horizontal grid lines (4 divisions)
-		for (int i = 1; i < 4; i++)
+		const auto margin = _grid_margin;
+		for (int i = 1; i < 4; ++i)
 		{
-			const int y = margin + (m_h - 2 * margin) * i / 4;
-			for (int x = margin; x < m_w - margin; x++)
-				SetPixel(x, y, m_style.gridLine);
+			const auto y = margin + (_height - 2 * margin) * i / 4;
+			for (int x = margin; x < _width - margin; ++x)
+				set_pixel(x, y, _style.gridLine);
 		}
-		// vertical grid lines
-		const int graphW = m_w - 2 * margin;
-		for (int i = 1; i < 6; i++)
+
+		const auto graph_width = _width - 2 * margin;
+		for (int i = 1; i < 6; ++i)
 		{
-			const int x = margin + graphW * i / 6;
-			for (int y = margin; y < m_h - margin; y++)
-				SetPixel(x, y, m_style.gridLine);
+			const auto x = margin + graph_width * i / 6;
+			for (int y = margin; y < _height - margin; ++y)
+				set_pixel(x, y, _style.gridLine);
 		}
-		// border
-		for (int x = margin; x < m_w - margin; x++)
+
+		for (int x = margin; x < _width - margin; ++x)
 		{
-			SetPixel(x, margin, m_style.axisColor);
-			SetPixel(x, m_h - margin - 1, m_style.axisColor);
+			set_pixel(x, margin, _style.axisColor);
+			set_pixel(x, _height - margin - 1, _style.axisColor);
 		}
-		for (int y = margin; y < m_h - margin; y++)
+		for (int y = margin; y < _height - margin; ++y)
 		{
-			SetPixel(margin, y, m_style.axisColor);
-			SetPixel(m_w - margin - 1, y, m_style.axisColor);
+			set_pixel(margin, y, _style.axisColor);
+			set_pixel(_width - margin - 1, y, _style.axisColor);
 		}
 	}
 
-	// Xiaolin Wu anti-aliased line
-	void DrawAALine(float x0, float y0, float x1, float y1, const ChartColor c)
+	void draw_aa_line(float x0, float y0, float x1, float y1, const ChartColor color)
 	{
 		const bool steep = std::abs(y1 - y0) > std::abs(x1 - x0);
 		if (steep)
@@ -191,119 +135,150 @@ private:
 			std::swap(x0, x1);
 			std::swap(y0, y1);
 		}
-		const float dx = x1 - x0, dy = y1 - y0;
-		const float gradient = dx == 0.f ? 1.f : dy / dx;
+		const auto dx = x1 - x0;
+		const auto dy = y1 - y0;
+		const auto gradient = dx == 0.0f ? 1.0f : dy / dx;
 
-		// first endpoint
-		float xend = std::round(x0);
-		float yend = y0 + gradient * (xend - x0);
-		float xgap = 1.f - (x0 + 0.5f - std::floor(x0 + 0.5f));
-		const int xpxl1 = static_cast<int>(xend);
-		const int ypxl1 = static_cast<int>(std::floor(yend));
+		auto xend = std::round(x0);
+		auto yend = y0 + gradient * (xend - x0);
+		auto xgap = 1.0f - (x0 + 0.5f - std::floor(x0 + 0.5f));
+		const auto xpxl1 = static_cast<int>(xend);
+		const auto ypxl1 = static_cast<int>(std::floor(yend));
 		if (steep)
 		{
-			SetPixelAA(ypxl1, xpxl1, c, (1.f - (yend - ypxl1)) * xgap);
-			SetPixelAA(ypxl1 + 1, xpxl1, c, (yend - ypxl1) * xgap);
+			set_pixel_aa(ypxl1, xpxl1, color, (1.0f - (yend - ypxl1)) * xgap);
+			set_pixel_aa(ypxl1 + 1, xpxl1, color, (yend - ypxl1) * xgap);
 		}
 		else
 		{
-			SetPixelAA(xpxl1, ypxl1, c, (1.f - (yend - ypxl1)) * xgap);
-			SetPixelAA(xpxl1, ypxl1 + 1, c, (yend - ypxl1) * xgap);
+			set_pixel_aa(xpxl1, ypxl1, color, (1.0f - (yend - ypxl1)) * xgap);
+			set_pixel_aa(xpxl1, ypxl1 + 1, color, (yend - ypxl1) * xgap);
 		}
-		float intery = yend + gradient;
+		auto intery = yend + gradient;
 
-		// second endpoint
 		xend = std::round(x1);
 		yend = y1 + gradient * (xend - x1);
 		xgap = x1 + 0.5f - std::floor(x1 + 0.5f);
-		const int xpxl2 = static_cast<int>(xend);
-		const int ypxl2 = static_cast<int>(std::floor(yend));
+		const auto xpxl2 = static_cast<int>(xend);
+		const auto ypxl2 = static_cast<int>(std::floor(yend));
 		if (steep)
 		{
-			SetPixelAA(ypxl2, xpxl2, c, (1.f - (yend - ypxl2)) * xgap);
-			SetPixelAA(ypxl2 + 1, xpxl2, c, (yend - ypxl2) * xgap);
+			set_pixel_aa(ypxl2, xpxl2, color, (1.0f - (yend - ypxl2)) * xgap);
+			set_pixel_aa(ypxl2 + 1, xpxl2, color, (yend - ypxl2) * xgap);
 		}
 		else
 		{
-			SetPixelAA(xpxl2, ypxl2, c, (1.f - (yend - ypxl2)) * xgap);
-			SetPixelAA(xpxl2, ypxl2 + 1, c, (yend - ypxl2) * xgap);
+			set_pixel_aa(xpxl2, ypxl2, color, (1.0f - (yend - ypxl2)) * xgap);
+			set_pixel_aa(xpxl2, ypxl2 + 1, color, (yend - ypxl2) * xgap);
 		}
 
-		// main loop
-		for (int x = xpxl1 + 1; x < xpxl2; x++)
+		for (int x = xpxl1 + 1; x < xpxl2; ++x)
 		{
-			const int iy = static_cast<int>(std::floor(intery));
-			const float frac = intery - iy;
+			const auto iy = static_cast<int>(std::floor(intery));
+			const auto fraction = intery - iy;
 			if (steep)
 			{
-				SetPixelAA(iy, x, c, 1.f - frac);
-				SetPixelAA(iy + 1, x, c, frac);
+				set_pixel_aa(iy, x, color, 1.0f - fraction);
+				set_pixel_aa(iy + 1, x, color, fraction);
 			}
 			else
 			{
-				SetPixelAA(x, iy, c, 1.f - frac);
-				SetPixelAA(x, iy + 1, c, frac);
+				set_pixel_aa(x, iy, color, 1.0f - fraction);
+				set_pixel_aa(x, iy + 1, color, fraction);
 			}
 			intery += gradient;
 		}
 	}
 
-	float DataToY(const float val) const
+	[[nodiscard]] float data_to_y(const float value) const
 	{
-		const int margin = m_gridMargin;
-		float range = m_maxVal - m_minVal;
-		if (range <= 0) range = 1;
-		float norm = (val - m_minVal) / range;
-		norm = std::clamp(norm, 0.f, 1.f);
-		return (m_h - margin - 1) - norm * (m_h - 2 * margin - 2);
+		const auto margin = _grid_margin;
+		const auto range = std::max(1.0f, _max_value - _min_value);
+		const auto normal = std::clamp((value - _min_value) / range, 0.0f, 1.0f);
+		return (_height - margin - 1) - normal * (_height - 2 * margin - 2);
 	}
 
-	float DataToX(const int idx) const
+	[[nodiscard]] float data_to_x(const int index) const
 	{
-		const int margin = m_gridMargin;
-		const int n = static_cast<int>(m_data.size());
-		if (n <= 1) return static_cast<float>(m_w / 2);
-		return margin + static_cast<float>(idx) / (n - 1) * (m_w - 2 * margin - 2);
+		const auto margin = _grid_margin;
+		const auto count = static_cast<int>(_data.size());
+		if (count <= 1) return static_cast<float>(_width / 2);
+		return margin + static_cast<float>(index) / (count - 1) *
+			(_width - 2 * margin - 2);
 	}
 
-	void DrawFilledArea()
+	void draw_filled_area()
 	{
-		const int margin = m_gridMargin;
-		const int n = static_cast<int>(m_data.size());
-		const float baseY = static_cast<float>(m_h - margin - 1);
-		for (int i = 0; i < n - 1; i++)
+		const auto margin = _grid_margin;
+		const auto count = static_cast<int>(_data.size());
+		const auto base_y = static_cast<float>(_height - margin - 1);
+		for (int i = 0; i + 1 < count; ++i)
 		{
-			const float x0 = DataToX(i), x1 = DataToX(i + 1);
-			const float y0 = DataToY(m_data[i]), y1 = DataToY(m_data[i + 1]);
-			const int ix0 = static_cast<int>(x0), ix1 = static_cast<int>(x1);
-			for (int x = ix0; x <= ix1; x++)
+			const auto x0 = data_to_x(i);
+			const auto x1 = data_to_x(i + 1);
+			const auto y0 = data_to_y(_data[i]);
+			const auto y1 = data_to_y(_data[i + 1]);
+			const auto ix0 = static_cast<int>(x0);
+			const auto ix1 = static_cast<int>(x1);
+			for (int x = ix0; x <= ix1; ++x)
 			{
-				const float t = (ix1 == ix0) ? 0.f : static_cast<float>(x - ix0) / (ix1 - ix0);
-				const float fy = y0 + t * (y1 - y0);
-				const int iy = static_cast<int>(fy);
-				const int ibase = static_cast<int>(baseY);
-				for (int y = iy; y <= ibase; y++)
-				{
-					const auto bg = GetPixel(x, y);
-					SetPixel(x, y, Blend(bg, m_style.fillColor, m_style.fillAlpha));
-				}
+				const auto t = ix1 == ix0 ? 0.0f :
+					static_cast<float>(x - ix0) / (ix1 - ix0);
+				const auto y = static_cast<int>(y0 + t * (y1 - y0));
+				const auto base = static_cast<int>(base_y);
+				for (int pixel_y = y; pixel_y <= base; ++pixel_y)
+					set_pixel(x, pixel_y,
+					          blend(get_pixel(x, pixel_y), _style.fillColor,
+					                _style.fillAlpha));
 			}
 		}
 	}
 
-	void DrawLine()
+	void draw_line()
 	{
-		const int n = static_cast<int>(m_data.size());
-		// Three passes (offsets 0, +0.5, -0.5) approximate a 2-pixel-thick line.
-		static constexpr float kOffsets[] = {0.f, 0.5f, -0.5f};
-		for (float off : kOffsets)
+		static constexpr float offsets[] = {0.0f, 0.5f, -0.5f};
+		const auto count = static_cast<int>(_data.size());
+		for (const auto offset : offsets)
+			for (int i = 0; i + 1 < count; ++i)
+				draw_aa_line(data_to_x(i), data_to_y(_data[i]) + offset,
+				             data_to_x(i + 1), data_to_y(_data[i + 1]) + offset,
+				             _style.lineColor);
+	}
+
+public:
+	void resize(const int width, const int height)
+	{
+		if (width == _width && height == _height && !_pixels.empty()) return;
+		_width = std::max(0, width);
+		_height = std::max(0, height);
+		_pixels.assign(static_cast<size_t>(_width) * _height, 0);
+	}
+
+	template <class Container>
+	void set_data(const Container& data, const float min_value = 0.0f,
+	              const float max_value = 100.0f)
+	{
+		_data.assign(data.begin(), data.end());
+		_min_value = min_value;
+		_max_value = max_value;
+	}
+
+	void set_style(const ChartStyle& style) { _style = style; }
+	void set_margin(const int margin) { _grid_margin = margin; }
+
+	void render()
+	{
+		if (_width <= 0 || _height <= 0) return;
+		fill(_style.background);
+		draw_grid();
+		if (!_data.empty())
 		{
-			for (int i = 0; i < n - 1; i++)
-			{
-				DrawAALine(DataToX(i), DataToY(m_data[i]) + off,
-				           DataToX(i + 1), DataToY(m_data[i + 1]) + off,
-				           m_style.lineColor);
-			}
+			draw_filled_area();
+			draw_line();
 		}
 	}
+
+	[[nodiscard]] int width() const { return _width; }
+	[[nodiscard]] int height() const { return _height; }
+	[[nodiscard]] const std::vector<uint32_t>& pixels() const { return _pixels; }
 };
