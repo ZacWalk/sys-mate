@@ -1,7 +1,7 @@
 #pragma once
 
 // SysMate's domain chart rasterizer.  It owns no window or device context:
-// rendering produces a top-down 32-bit bitmap that pf::draw_context displays.
+// rendering produces a top-down 32-bit bitmap that render::draw_surface displays.
 
 #include <algorithm>
 #include <cmath>
@@ -282,3 +282,4 @@ public:
 	[[nodiscard]] int height() const { return _height; }
 	[[nodiscard]] const std::vector<uint32_t>& pixels() const { return _pixels; }
 };
+

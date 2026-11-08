@@ -31,11 +31,11 @@ endif()
 include(FetchContent)
 FetchContent_Declare(libdesktop
     GIT_REPOSITORY https://github.com/ZacWalk/libdesktop.git
-    GIT_TAG        31aae322af6e0696a9597726705b1121bd31580b
+    GIT_TAG        04109ee82a500db38d439fa281bbc3f43124adfe
 )
 FetchContent_MakeAvailable(libdesktop)
 
-platform_add_app(sys-mate UI
+libdesktop_add_app(sys-mate
     SOURCES
         src/main.cpp
         src/native_monitoring.cpp
@@ -48,8 +48,9 @@ platform_add_app(sys-mate UI
 target_include_directories(sys-mate PRIVATE src)
 target_compile_features(sys-mate PRIVATE cxx_std_20)
 target_compile_definitions(sys-mate PRIVATE WIN32 _WINDOWS UNICODE _UNICODE)
-target_compile_options(sys-mate PRIVATE /W3 /MP /permissive- /sdl)
+target_compile_options(sys-mate PRIVATE /W3 /MP /permissive- /sdl /EHsc)
 target_link_libraries(sys-mate PRIVATE
+    libdesktop::ui
     pdh
     iphlpapi
     psapi

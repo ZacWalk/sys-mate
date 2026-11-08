@@ -1,14 +1,15 @@
 // SysMate application shell.
 //
-// The platform boundary is deliberately visible: pf:: owns the window,
-// reactor, message loop, menus, drawing, input and DPI; native_monitoring owns
-// PDH and the Windows inspection APIs.  The code between them is a portable UI
-// model and a set of pf reactors.
+// SysMate is a ui application: libdesktop owns the native window, input
+// dispatch, menus, DPI and frame loop. The monitoring backend remains the
+// only Windows-facing part of the application.
 
-#include "platform.h"
-#include "ui/view_list.h"
-#include "ui/widgets.h"
-#include "ui/test_support.h"
+#include "libdesktop/ui.h"
+#include "libdesktop/ui/controls.h"
+#include "libdesktop/ui/elements.h"
+#include "libdesktop/ui/menu_bar.h"
+#include "libdesktop/ui/test_support.h"
+#include "libdesktop/ui/views.h"
 
 #include "chart.h"
 #include "native_monitoring.h"
@@ -18,6 +19,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <format>
 #include <functional>
@@ -36,20 +38,8 @@ namespace
 	using sysmate::ui::tab_id;
 
 	constexpr int chart_count = 6;
-	constexpr uint32_t performance_timer = 1;
 	constexpr std::string_view tab_names[] = {
 		"Performance", "Processes", "Network", "Windows", "About"};
-
-	enum class chart_id
-	{
-		cpu,
-		memory,
-		disk,
-		network,
-		gpu,
-		handles,
-	};
-
 	constexpr std::string_view chart_names[] = {
 		"CPU", "Memory", "Disk", "Network", "GPU", "Handles"};
 
@@ -112,75 +102,246 @@ namespace
 			connection.state, connection.pid, connection.process_name));
 	}
 
-	uint64_t window_identity(const window_info& window)
-	{
-		return window.window_id;
-	}
+	uint64_t window_identity(const window_info& window) { return window.window_id; }
 
 	uint64_t module_identity(const std::string_view path, const uint64_t size)
 	{
 		return hash_text(std::format("{}:{}", path, size));
 	}
 
-	struct sysmate_theme final : pf::ui::theme
+	class sysmate_theme final : public ui::view_theme
 	{
+	public:
 		void set_dpi(const double scale)
 		{
 			dpi_scale = scale > 0.0 ? scale : 1.0;
 			list_font_height = std::max(8, sysmate::ui::scale(13, dpi_scale));
 			text_font_height = list_font_height;
-			list_font = {list_font_height, pf::font_name::calibri};
-			edit_font = {list_font_height, pf::font_name::calibri};
-			text_font = {list_font_height, pf::font_name::consolas};
+			list_font = {"Calibri", list_font_height};
+			edit_font = {"Calibri", list_font_height};
+			text_font = {"Consolas", list_font_height};
 			padding_x = sysmate::ui::scale(6, dpi_scale);
 			padding_y = sysmate::ui::scale(3, dpi_scale);
 			indent = sysmate::ui::scale(16, dpi_scale);
 			list_top_pad = sysmate::ui::scale(2, dpi_scale);
 			list_scroll_pad = sysmate::ui::scale(4, dpi_scale);
 
-			window_background = {30, 30, 30};
-			tool_background = {42, 42, 46};
-			text = {225, 225, 225};
-			dim_text = {165, 165, 170};
-			group_text = {225, 195, 80};
-			line = {80, 120, 180};
-			match_highlight = {0, 100, 180};
-			header_background = {50, 50, 56};
-			handle = {55, 55, 62};
-			handle_hover = {70, 70, 78};
-			handle_tracking = {0, 100, 180};
-			focus_handle = {0, 120, 210};
+			window_background = core::rgb(30, 30, 30);
+			tool_background = core::rgb(42, 42, 46);
+			text = core::rgb(225, 225, 225);
+			dim_text = core::rgb(165, 165, 170);
+			group_text = core::rgb(225, 195, 80);
+			line = core::rgb(80, 120, 180);
+			match_highlight = core::rgb(0, 100, 180);
+			header_background = core::rgb(50, 50, 56);
+			handle = core::rgb(55, 55, 62);
+			handle_hover = core::rgb(70, 70, 78);
+			handle_tracking = core::rgb(0, 100, 180);
+			focus_handle = core::rgb(0, 120, 210);
 		}
 	};
 
-	void draw_text(pf::draw_context& dc, const std::string_view text,
-	               const pf::font& font, const pf::color_t color,
-	               const pf::color_t background, const sysmate::ui::rect bounds)
+	class dashboard_element final : public ui::element
 	{
-		if (text.empty() || bounds.width() <= 0 || bounds.height() <= 0) return;
-		const auto size = dc.measure_text(text, font);
-		auto clipped = bounds;
-		clipped.right = std::min(clipped.right, clipped.left + size.cx);
-		clipped.bottom = std::min(clipped.bottom, clipped.top + size.cy);
-		if (clipped.width() <= 0 || clipped.height() <= 0) return;
-		dc.draw_text(bounds.left, bounds.top, {bounds.left, bounds.top,
-		                                      bounds.right, bounds.bottom},
-		             text, font, color, background);
-	}
+	public:
+		std::vector<ui::element_ptr> children;
+		std::function<void(render::measure_context&, core::recti)> layout_children;
+		std::function<void(render::draw_context&, core::recti)> paint_decoration;
+		core::color32 background = core::rgb(30, 30, 30);
 
-	void draw_centered_text(pf::draw_context& dc, const std::string_view text,
-	                        const pf::font& font, const pf::color_t color,
-	                        const pf::color_t background, const sysmate::ui::rect bounds)
+		dashboard_element() { padding(0); margin(0); }
+
+		core::sizei measure(render::measure_context&, const int width_limit) const override
+		{
+			return {width_limit, 0};
+		}
+
+		void layout(render::measure_context& mc, const core::recti bounds_in) override
+		{
+			bounds = bounds_in;
+			if (layout_children) layout_children(mc, bounds);
+		}
+
+		void render(render::draw_context& dc, const core::pointi offset) const override
+		{
+			dc.draw_rect(bounds.offset(offset), core::color(background, dc.colors.alpha));
+			if (paint_decoration) paint_decoration(dc, bounds.offset(offset));
+			for (const auto& child : children)
+				if (child && child->is_visible()) child->render(dc, offset);
+		}
+
+		void visit_children(const std::function<void(const ui::element_ptr&)>& visit) const override
+		{
+			for (const auto& child : children) visit(child);
+		}
+	};
+
+	class performance_element final : public ui::element
 	{
-		if (text.empty()) return;
-		const auto size = dc.measure_text(text, font);
-		const auto x = bounds.left + std::max(0, (bounds.width() - size.cx) / 2);
-		const auto y = bounds.top + std::max(0, (bounds.height() - size.cy) / 2);
-		dc.draw_text(x, y, {bounds.left, bounds.top, bounds.right, bounds.bottom},
-		             text, font, color, background);
-	}
+		std::function<void(render::draw_context&, core::recti)> _paint;
 
-	class table_view final : public pf::ui::list_view
+	public:
+		explicit performance_element(std::function<void(render::draw_context&, core::recti)> paint) :
+			_paint(std::move(paint)) { padding(0); margin(0); }
+
+		core::sizei measure(render::measure_context&, const int width_limit) const override
+		{
+			return {width_limit, 0};
+		}
+
+		void render(render::draw_context& dc, const core::pointi offset) const override
+		{
+			if (_paint) _paint(dc, bounds.offset(offset));
+		}
+	};
+
+	class about_element final : public ui::element
+	{
+		sysmate_theme& _theme;
+		std::vector<std::pair<std::string, std::string>> _rows;
+		core::surface_ptr _icon;
+		int _scroll_position = 0;
+		int _content_height = 0;
+		std::function<void()> _changed;
+
+		int scale(const int value) const
+		{
+			return sysmate::ui::scale(value, _theme.dpi_scale);
+		}
+
+		void update_scroll() const
+		{
+			// The mutable scroll position is updated by wheel/layout; painting only clamps it.
+			const_cast<about_element*>(this)->_scroll_position = std::clamp(
+				_scroll_position, 0, std::max(0, _content_height - bounds.height()));
+		}
+
+		void draw_text(render::draw_context& dc, const std::string_view text,
+		               const render::font_face font, const core::color32 color,
+		               const core::recti rect) const
+		{
+			if (text.empty() || rect.is_empty()) return;
+			dc.draw_text(text, rect, font, render::text_style::single_line,
+			             core::color(color, dc.colors.alpha), core::color(0, 0, 0, 0));
+		}
+
+	public:
+		about_element(sysmate_theme& theme, std::function<void()> changed) :
+			_theme(theme), _changed(std::move(changed))
+		{
+			padding(0);
+			margin(0);
+			const auto data = platform::embedded_resource_data("sys-mate.ico");
+			if (!data.empty()) _icon = platform::load_image_memory(data);
+		}
+
+		void set_rows(std::vector<std::pair<std::string, std::string>> rows)
+		{
+			_rows = std::move(rows);
+			_content_height = scale(28) * 2 + scale(46 + 28 + 36 + 20) +
+				static_cast<int>(_rows.size()) * scale(26);
+			update_scroll();
+			if (_changed) _changed();
+		}
+
+		bool wheel(const core::pointi loc, const core::pointi element_offset, const int delta) override
+		{
+			const auto area = bounds.offset(element_offset);
+			if (!area.contains(loc) || _content_height <= area.height()) return false;
+			const auto before = _scroll_position;
+			_scroll_position = std::clamp(_scroll_position - delta / 2, 0,
+				std::max(0, _content_height - area.height()));
+			if (_scroll_position != before && _changed) _changed();
+			return true;
+		}
+
+		bool key_down(const int key)
+		{
+			const auto maximum = std::max(0, _content_height - bounds.height());
+			if (maximum == 0) return false;
+			const auto page = std::max(1, bounds.height() - scale(24));
+			int next = _scroll_position;
+			const auto k = static_cast<char32_t>(key);
+			if (k == platform::keys::UP) next -= scale(26);
+			else if (k == platform::keys::DOWN) next += scale(26);
+			else if (k == platform::keys::PRIOR) next -= page;
+			else if (k == platform::keys::NEXT) next += page;
+			else if (k == platform::keys::HOME) next = 0;
+			else if (k == platform::keys::END) next = maximum;
+			else return false;
+			next = std::clamp(next, 0, maximum);
+			if (next == _scroll_position) return true;
+			_scroll_position = next;
+			if (_changed) _changed();
+			return true;
+		}
+
+		core::sizei measure(render::measure_context&, const int width_limit) const override
+		{
+			return {width_limit, 0};
+		}
+
+		void render(render::draw_context& dc, const core::pointi offset) const override
+		{
+			const auto area = bounds.offset(offset);
+			dc.draw_rect(area, core::color(_theme.window_background, dc.colors.alpha));
+			update_scroll();
+			render::scoped_clip clip(dc, area);
+
+			const auto left = area.left + scale(28);
+			const auto right = area.right - scale(28);
+			int y = area.top + scale(28) - _scroll_position;
+			if (_icon)
+				render::draw_surface(dc, _icon, {left, y, left + scale(64), y + scale(64)},
+				                     1.0f, render::texture_sampler::point);
+
+			const auto text_left = left + scale(64 + 16);
+			const auto title_font = render::make_font({"Calibri", scale(32)});
+			const auto subtitle_font = render::make_font({"Calibri", scale(18)});
+			const auto body_font = render::make_font(_theme.list_font);
+			draw_text(dc, "SysMate", title_font, _theme.text,
+			          {text_left, y, right, y + scale(42)});
+			y += scale(46);
+			draw_text(dc, "Version 2.0 - System Information Utility", subtitle_font,
+			          _theme.dim_text, {text_left, y, right, y + scale(24)});
+			y += scale(28);
+			draw_text(dc, "Copyright (C) 2002 Zac Walker", body_font,
+			          _theme.dim_text, {text_left, y, right, y + scale(20)});
+			y += scale(36);
+			dc.draw_rect({left, y, right, y + scale(1)}, core::color(_theme.handle, dc.colors.alpha));
+			y += scale(20);
+
+			const auto label_width = scale(170);
+			const auto value_left = left + scale(180);
+			for (const auto& [label, value] : _rows)
+			{
+				draw_text(dc, label, body_font, _theme.dim_text,
+
+				          {left, y, left + label_width, y + scale(22)});
+				draw_text(dc, value, body_font, _theme.text,
+				          {value_left, y, right, y + scale(22)});
+				y += scale(26);
+			}
+
+			if (_content_height > area.height())
+			{
+				const auto width = std::max(3, scale(8));
+				const auto track = core::recti(area.right - width, area.top,
+				                              area.right, area.bottom);
+				const auto thumb_height = std::max(scale(24),
+				                                  track.height() * area.height() / _content_height);
+				const auto travel = std::max(0, track.height() - thumb_height);
+				const auto thumb_top = track.top + (_scroll_position * travel /
+				                                  std::max(1, _content_height - area.height()));
+				dc.draw_rect(track, core::color(_theme.handle, dc.colors.alpha * 0.35f));
+				dc.draw_rounded_rect({track.left, thumb_top, track.right, thumb_top + thumb_height},
+				                    core::color(_theme.handle_hover, dc.colors.alpha), dc.padding1);
+			}
+
+		}
+	};
+
+	class table_view final : public ui::list_view
 	{
 		struct row_tag
 		{
@@ -190,24 +351,20 @@ namespace
 
 		sysmate::ui::table_model _model;
 		std::string _empty_text = "Empty";
-		pf::window_frame_ptr _window;
 		sysmate::ui::header_drag_state _drag;
 		std::function<void(std::shared_ptr<void>)> _on_selection;
-		std::function<std::vector<pf::menu_command>(std::shared_ptr<void>)> _popup;
-		std::function<void(bool)> _on_tab;
+		std::function<std::vector<ui::command_ptr>(std::shared_ptr<void>)> _popup;
 
 		void rebuild_items()
 		{
 			const auto selected = _model.selected_id();
 			_items.clear();
 			_items.reserve(_model.rows().size());
-
 			for (const auto& model_row : _model.rows())
 			{
-				auto item = std::make_shared<pf::ui::list_item>();
+				auto item = std::make_shared<ui::list_item>();
 				item->text = model_row.cells.empty() ? std::string() : model_row.cells.front();
-				for (const auto& cell : model_row.cells)
-					item->cells.emplace_back(cell);
+				for (const auto& cell : model_row.cells) item->cells.emplace_back(cell);
 				item->data = std::make_shared<row_tag>(row_tag{model_row.id, model_row.data});
 				_items.push_back(std::move(item));
 			}
@@ -224,28 +381,35 @@ namespace
 					break;
 				}
 			}
-
 			layout_list();
 		}
 
-		void select_position(const pf::window_frame_ptr& window, int index)
+		void select_position(const int index)
 		{
 			if (_items.empty()) return;
-			index = std::clamp(index, 0, static_cast<int>(_items.size()) - 1);
-			set_selected(index);
-			const auto tag = std::static_pointer_cast<row_tag>(_items[index]->data);
+			const auto clamped = std::clamp(index, 0, static_cast<int>(_items.size()) - 1);
+			set_selected(clamped);
+			const auto tag = std::static_pointer_cast<row_tag>(_items[clamped]->data);
 			if (tag)
 			{
 				_model.select_id(tag->id);
 				if (_on_selection) _on_selection(tag->payload);
 			}
-			ensure_visible(window, _items[index]);
-			window->invalidate();
+			ensure_visible(_items[clamped]);
+			invalidate();
+		}
+
+		int edge_column(const int x) const
+		{
+			const auto rects = column_rects(_view_extent.cx);
+			const auto hit_zone = std::max(3, sysmate::ui::scale(4, _theme.dpi_scale));
+			for (int i = 0; i + 1 < static_cast<int>(rects.size()); ++i)
+				if (std::abs(x - rects[i].right) <= hit_zone) return i;
+			return -1;
 		}
 
 	public:
-		table_view(sysmate_theme& theme, std::vector<pf::ui::list_column> columns)
-			: pf::ui::list_view(theme)
+		table_view(sysmate_theme& theme, std::vector<ui::list_column> columns) : ui::list_view(theme)
 		{
 			set_columns(std::move(columns));
 		}
@@ -254,10 +418,8 @@ namespace
 		{
 			_model.set_rows(std::move(rows));
 			rebuild_items();
-			// A refresh can happen before the first WM_SIZE.  The next size
-			// message will lay out the rows again using real font metrics.
 			if (_view_extent.cx > 0) layout_list();
-			if (_window) _window->invalidate();
+			invalidate();
 		}
 
 		void set_filter(std::string filter)
@@ -265,183 +427,142 @@ namespace
 			_model.set_filter(std::move(filter));
 			rebuild_items();
 			if (_view_extent.cx > 0) layout_list();
-			if (_window) _window->invalidate();
+			invalidate();
 		}
 
 		void set_empty_text(std::string text) { _empty_text = std::move(text); }
-
 		[[nodiscard]] std::shared_ptr<void> selected_data() const
 		{
 			const auto* row = _model.selected_row();
 			return row ? row->data : nullptr;
 		}
-
 		[[nodiscard]] uint64_t selected_id() const { return _model.selected_id(); }
 		[[nodiscard]] const std::string& filter() const { return _model.filter(); }
 
 		bool select_first_for_test()
 		{
-			if (!_window || _items.empty()) return false;
-			select_position(_window, 0);
+			if (_items.empty()) return false;
+			select_position(0);
 			return true;
 		}
 
-		[[nodiscard]] int row_count_for_test() const
-		{
-			return static_cast<int>(_items.size());
-		}
-
+		[[nodiscard]] int row_count_for_test() const { return static_cast<int>(_items.size()); }
 		[[nodiscard]] std::shared_ptr<void> payload_for_test(const int index) const
 		{
 			if (index < 0 || index >= static_cast<int>(_items.size())) return nullptr;
 			const auto tag = std::static_pointer_cast<row_tag>(_items[index]->data);
 			return tag ? tag->payload : nullptr;
 		}
-
-		[[nodiscard]] bool header_drag_active_for_test() const
-		{
-			return _drag.active();
-		}
-
-		uint32_t handle_message(pf::window_frame_ptr window,
-		                       const pf::message_type message,
-		                       const pf::message_params& params) override
-		{
-			_window = window;
-			if (message == pf::message_type::capture_changed)
-			{
-				if (_drag.active())
-				{
-					_drag.capture_changed();
-					window->invalidate();
-				}
-				return 0;
-			}
-			return pf::ui::list_view::handle_message(window, message, params);
-		}
+		[[nodiscard]] bool header_drag_active_for_test() const { return _drag.active(); }
 
 		void set_on_selection(std::function<void(std::shared_ptr<void>)> callback)
 		{
 			_on_selection = std::move(callback);
 		}
-
-		void set_popup(std::function<std::vector<pf::menu_command>(std::shared_ptr<void>)> callback)
+		void set_popup(std::function<std::vector<ui::command_ptr>(std::shared_ptr<void>)> callback)
 		{
 			_popup = std::move(callback);
 		}
 
-		void set_on_tab(std::function<void(bool)> callback)
-		{
-			_on_tab = std::move(callback);
-		}
-
-		std::vector<pf::menu_command> default_popup_menu() override
+		std::vector<ui::command_ptr> default_popup_menu() override
 		{
 			if (_popup) return _popup(selected_data());
-			return pf::ui::list_view::default_popup_menu();
+			return ui::list_view::default_popup_menu();
 		}
 
-		uint32_t handle_mouse(pf::window_frame_ptr window,
-		                      const pf::mouse_message_type message,
-		                      const pf::mouse_params& params) override
+		void paint(render::draw_context& dc, const bool focused) const override
 		{
-			const auto edge_column = [&](const int x)
-			{
-				const auto rects = column_rects(window->get_client_rect().width());
-				const auto hit_zone = sysmate::ui::scale(4, _theme.dpi_scale);
-				for (int i = 0; i + 1 < static_cast<int>(rects.size()); ++i)
-					if (std::abs(x - rects[i].right) <= hit_zone) return i;
-				return -1;
-			};
+			ui::list_view::paint(dc, focused);
+			if (!_items.empty()) return;
+			const auto face = render::make_font(_theme.list_font);
+			const auto size = dc.measure_text(_empty_text, face, render::text_style::single_line,
+			                                 _view_extent.cx, _view_extent.cy);
+			const auto top = _header_height + std::max(0, (_view_extent.cy - _header_height - size.cy) / 2);
+			dc.draw_text(_empty_text,
+			             {std::max(0, (_view_extent.cx - size.cx) / 2), top,
+			              _view_extent.cx, top + size.cy},
+			             face, render::text_style::single_line,
+			             core::color(_theme.dim_text, dc.colors.alpha),
+			             core::color(_theme.tool_background, dc.colors.alpha));
+		}
 
-			if (message == pf::mouse_message_type::set_cursor &&
-				params.point.y < _header_height)
+
+		bool on_key(const int key, const platform::key_state keys) override
+		{
+			const auto k = static_cast<char32_t>(key);
+			if (k == platform::keys::HOME || k == platform::keys::END ||
+				k == platform::keys::PRIOR || k == platform::keys::NEXT)
 			{
-				if (edge_column(params.point.x) >= 0)
+				if (_items.empty()) return true;
+				const auto row_height = std::max(1, _font_extent.cy + _theme.padding_y * 2);
+				const auto page = std::max(1, _view_extent.cy / row_height);
+				if (k == platform::keys::HOME) select_position(0);
+				else if (k == platform::keys::END) select_position(static_cast<int>(_items.size()) - 1);
+				else
 				{
-					window->set_cursor_shape(pf::cursor_shape::size_we);
-					return 1;
+					const auto delta = k == platform::keys::PRIOR ? -page : page;
+					const auto current = selected_index();
+					select_position(current < 0 ? (delta < 0 ? 0 : page) : current + delta);
+				}
+				return true;
+			}
+			return ui::list_view::on_key(key, keys);
+		}
+
+		void on_mouse_down(const core::pointi loc, const platform::key_state keys) override
+		{
+			if (loc.y < _header_height)
+			{
+				if (const auto column = edge_column(loc.x); column >= 0)
+				{
+					take_focus(false);
+					_drag.begin(column, loc.x);
+					if (host()) host()->capture_pointer(true);
+					return;
 				}
 			}
-			if (message == pf::mouse_message_type::left_button_down &&
-				params.point.y < _header_height)
+			ui::list_view::on_mouse_down(loc, keys);
+		}
+
+		void on_mouse_move(const core::pointi loc, const bool captured) override
+		{
+			if (_drag.active())
 			{
-				if (const auto column = edge_column(params.point.x); column >= 0)
+				if (!captured)
 				{
-					_drag.begin(column, params.point.x);
-					window->set_capture();
-					return 1;
+					_drag.capture_changed();
+					return;
 				}
-			}
-			if (message == pf::mouse_message_type::mouse_move && _drag.active())
-			{
-				const auto delta = _drag.move(params.point.x);
+				const auto delta = _drag.move(loc.x);
 				if (delta != 0)
 				{
 					_columns[_drag.column].weight = std::max(
 						sysmate::ui::scale(30, _theme.dpi_scale),
 						_columns[_drag.column].weight + delta);
-					window->invalidate();
+					layout_list();
 				}
-				return 1;
+				return;
 			}
-			if (message == pf::mouse_message_type::left_button_up && _drag.active())
+			ui::list_view::on_mouse_move(loc, captured);
+		}
+
+		void on_mouse_up(const core::pointi loc, const platform::key_state keys) override
+		{
+			if (_drag.active())
 			{
 				_drag.capture_changed();
-				window->release_capture();
-				return 1;
+				if (host()) host()->capture_pointer(false);
+				invalidate();
+				return;
 			}
-			return pf::ui::list_view::handle_mouse(window, message, params);
+			ui::list_view::on_mouse_up(loc, keys);
 		}
 
-		void handle_paint(pf::window_frame_ptr& window, pf::draw_context& dc) override
+		platform::cursor cursor_at(const core::pointi loc) const override
 		{
-			pf::ui::list_view::handle_paint(window, dc);
-			if (!_items.empty()) return;
-			const auto client = window->get_client_rect();
-			const auto size = dc.measure_text(_empty_text, _theme.list_font);
-			const auto top = _header_height + std::max(0, (client.height() - _header_height - size.cy) / 2);
-			dc.draw_text(std::max(0, (client.width() - size.cx) / 2), top,
-			             {0, _header_height, client.right, client.bottom},
-			             _empty_text, _theme.list_font, _theme.dim_text,
-			             _theme.tool_background);
-		}
-
-		uint32_t handle_keyboard(pf::window_frame_ptr window,
-		                         const pf::keyboard_message_type message,
-		                         const pf::keyboard_params& params) override
-		{
-			if (message != pf::keyboard_message_type::key_down)
-				return pf::ui::list_view::handle_keyboard(window, message, params);
-
-			if (params.vk == pf::platform_key::Tab)
-			{
-				if (_on_tab) _on_tab(window->is_key_down(pf::platform_key::Shift));
-				return 1;
-			}
-
-			if (params.vk == pf::platform_key::Home && !_items.empty())
-			{
-				select_position(window, 0);
-				return 1;
-			}
-			if (params.vk == pf::platform_key::End && !_items.empty())
-			{
-				select_position(window, static_cast<int>(_items.size()) - 1);
-				return 1;
-			}
-			if ((params.vk == pf::platform_key::Prior || params.vk == pf::platform_key::Next) &&
-				!_items.empty())
-			{
-				const auto row_height = std::max(1, _font_extent.cy + _theme.padding_y * 2);
-				const auto page = std::max(1, _view_extent.cy / row_height);
-				const auto delta = params.vk == pf::platform_key::Prior ? -page : page;
-				const auto current = selected_index();
-				select_position(window, current < 0 ? (delta < 0 ? 0 : page) : current + delta);
-				return 1;
-			}
-
-			return pf::ui::list_view::handle_keyboard(window, message, params);
+			if (loc.y < _header_height && edge_column(loc.x) >= 0)
+				return platform::cursor::left_right;
+			return ui::list_view::cursor_at(loc);
 		}
 
 	protected:
@@ -452,8 +573,7 @@ namespace
 			if (_view_extent.cx > 0) layout_list();
 		}
 
-		void on_item_selected(const pf::window_frame_ptr&,
-		                      const pf::ui::list_item_ptr& item, const bool) override
+		void on_item_selected(const ui::list_item_ptr& item, const bool) override
 		{
 			const auto tag = item ? std::static_pointer_cast<row_tag>(item->data) : nullptr;
 			_model.select_id(tag ? tag->id : 0);
@@ -461,800 +581,77 @@ namespace
 		}
 	};
 
-	class filter_view final : public pf::frame_reactor
+	class sysmate_app final : public ui::app, public ui::frame_host,
+	                           public std::enable_shared_from_this<sysmate_app>
 	{
-		sysmate_theme& _theme;
-		pf::ui::edit_box_widget _input;
-		std::function<void(std::string_view)> _on_change;
-		std::function<void(bool)> _on_tab;
-
-		void changed(const bool modified)
-		{
-			if (modified && _on_change) _on_change(_input.edit.text);
-		}
-
-		void draw_segment(pf::draw_context& dc, const std::string_view text,
-		                 const int x, const pf::color_t background,
-		                 const pf::irect& bounds)
-		{
-			if (text.empty()) return;
-			const auto size = dc.measure_text(text, _theme.edit_font);
-			const auto right = std::min(bounds.right, x + size.cx);
-			if (right <= x) return;
-			dc.draw_text(x, bounds.top, {x, bounds.top, right, bounds.bottom},
-			             text, _theme.edit_font, _theme.text, background);
-		}
-
-	public:
-		explicit filter_view(sysmate_theme& theme) : _theme(theme)
-		{
-		}
-
-		void set_on_change(std::function<void(std::string_view)> callback)
-		{
-			_on_change = std::move(callback);
-		}
-
-		void set_on_tab(std::function<void(bool)> callback)
-		{
-			_on_tab = std::move(callback);
-		}
-
-		void set_text(const std::string_view text)
-		{
-			_input.edit.text = std::string(text);
-			_input.edit.cursor_pos = static_cast<int>(_input.edit.text.size());
-			_input.edit.sel_anchor = _input.edit.cursor_pos;
-		}
-
-		[[nodiscard]] const std::string& text() const { return _input.edit.text; }
-
-		[[nodiscard]] std::string selected_text_for_test() const
-		{
-			return std::string(_input.edit.selected_text());
-		}
-
-		void focus_select_all(const pf::window_frame_ptr& window)
-		{
-			window->set_focus();
-			_input.edit.select_all();
-			_input.reset_caret(window);
-			window->invalidate();
-		}
-
-		uint32_t handle_message(pf::window_frame_ptr window,
-		                       const pf::message_type message,
-		                       const pf::message_params& params) override
-		{
-			if (message == pf::message_type::erase_background) return 1;
-			if (message == pf::message_type::set_focus)
-			{
-				_input.update_focus(window, true);
-				window->invalidate();
-			}
-			if (message == pf::message_type::kill_focus)
-			{
-				_input.update_focus(window, false);
-				window->invalidate();
-			}
-			if (message == pf::message_type::timer && _input.on_timer(params.timer_id))
-				window->invalidate();
-			return 0;
-		}
-
-		uint32_t handle_mouse(pf::window_frame_ptr window,
-		                      const pf::mouse_message_type message,
-		                      const pf::mouse_params& params) override
-		{
-			if (message == pf::mouse_message_type::set_cursor)
-			{
-				window->set_cursor_shape(pf::cursor_shape::ibeam);
-				return 1;
-			}
-			if (message != pf::mouse_message_type::left_button_down) return 0;
-			window->set_focus();
-			const auto measure = window->create_measure_context();
-			if (measure)
-			{
-				const auto target_x = std::max(0, params.point.x -
-					sysmate::ui::scale(6, _theme.dpi_scale));
-				int best = 0;
-				int position = 0;
-				while (position < static_cast<int>(_input.edit.text.size()))
-				{
-					const auto next = pf::utf8_next(_input.edit.text, position);
-					const auto width = measure->measure_text(
-						std::string_view(_input.edit.text).substr(0, next), _theme.edit_font).cx;
-					if (target_x < width)
-					{
-						const auto previous_width = measure->measure_text(
-							std::string_view(_input.edit.text).substr(0, position),
-							_theme.edit_font).cx;
-						best = target_x - previous_width < width - target_x ? position : next;
-						break;
-					}
-					best = next;
-					position = next;
-				}
-				_input.edit.cursor_pos = best;
-			}
-			else
-			{
-				_input.edit.cursor_pos = static_cast<int>(_input.edit.text.size());
-			}
-			if (!window->is_key_down(pf::platform_key::Shift))
-				_input.edit.sel_anchor = _input.edit.cursor_pos;
-			_input.reset_caret(window);
-			window->invalidate();
-			return 1;
-		}
-
-		uint32_t handle_keyboard(pf::window_frame_ptr window,
-		                         const pf::keyboard_message_type message,
-		                         const pf::keyboard_params& params) override
-		{
-			if (message == pf::keyboard_message_type::char_input)
-			{
-				const auto modified = _input.on_char(window, params.ch);
-				changed(modified);
-				window->invalidate();
-				return 1;
-			}
-			if (message != pf::keyboard_message_type::key_down) return 0;
-
-			if (params.vk == pf::platform_key::Tab)
-			{
-				if (_on_tab) _on_tab(window->is_key_down(pf::platform_key::Shift));
-				return 1;
-			}
-
-			if (window->is_key_down(pf::platform_key::Control))
-			{
-				switch (params.vk)
-				{
-				case 'A':
-					_input.edit.select_all();
-					window->invalidate();
-					return 1;
-				case 'C':
-					(void)_input.edit.copy_to_clipboard();
-					return 1;
-				case 'X':
-					changed(_input.edit.cut_to_clipboard());
-					_input.reset_caret(window);
-					window->invalidate();
-					return 1;
-				case 'V':
-					changed(_input.edit.paste_from_clipboard());
-					_input.reset_caret(window);
-					window->invalidate();
-					return 1;
-				default:
-					break;
-				}
-			}
-
-			if (params.vk == pf::platform_key::Back)
-			{
-				changed(_input.edit.delete_back());
-				_input.reset_caret(window);
-				window->invalidate();
-				return 1;
-			}
-
-			bool modified = false;
-			if (_input.on_key_down(window, params.vk, modified))
-			{
-				changed(modified);
-				window->invalidate();
-				return 1;
-			}
-			return 0;
-		}
-
-		void handle_paint(pf::window_frame_ptr& window, pf::draw_context& dc) override
-		{
-			const auto client = window->get_client_rect();
-			const auto background = _theme.tool_background;
-			dc.fill_solid_rect(client, background);
-			pf::ui::edit_box::draw_border(dc, {0, 0, client.right, client.bottom},
-			                              window->has_focus(), _theme.dpi_scale);
-
-			const auto bounds = pf::irect(sysmate::ui::scale(6, _theme.dpi_scale),
-			                              sysmate::ui::scale(3, _theme.dpi_scale),
-			                              client.right - sysmate::ui::scale(6, _theme.dpi_scale),
-			                              client.bottom - sysmate::ui::scale(3, _theme.dpi_scale));
-			const auto before = std::string_view(_input.edit.text).substr(0, _input.edit.sel_start());
-			const auto selected = std::string_view(_input.edit.text).substr(
-				_input.edit.sel_start(), _input.edit.sel_end() - _input.edit.sel_start());
-			const auto after = std::string_view(_input.edit.text).substr(_input.edit.sel_end());
-			auto x = bounds.left;
-			draw_segment(dc, before, x, background, bounds);
-			x += dc.measure_text(before, _theme.edit_font).cx;
-			draw_segment(dc, selected, x, _theme.match_highlight, bounds);
-			x += dc.measure_text(selected, _theme.edit_font).cx;
-			draw_segment(dc, after, x, background, bounds);
-			if (_input.caret.visible && window->has_focus())
-				_input.edit.draw_caret(dc, bounds.left, bounds.top, bounds.height(), _theme.edit_font,
-				                 _theme.dpi_scale);
-		}
-
-		void handle_size(pf::window_frame_ptr&, pf::isize, pf::measure_context&) override
-		{
-		}
-	};
-
-	class performance_view final : public pf::frame_reactor
-	{
-		std::function<void(pf::draw_context&, pf::irect)> _paint;
-
-	public:
-		explicit performance_view(std::function<void(pf::draw_context&, pf::irect)> paint)
-			: _paint(std::move(paint))
-		{
-		}
-
-		uint32_t handle_message(pf::window_frame_ptr,
-		                       const pf::message_type message,
-		                       const pf::message_params&) override
-		{
-			return message == pf::message_type::erase_background ? 1 : 0;
-		}
-
-		void handle_paint(pf::window_frame_ptr& window, pf::draw_context& dc) override
-		{
-			if (_paint) _paint(dc, window->get_client_rect());
-		}
-
-		void handle_size(pf::window_frame_ptr&, pf::isize, pf::measure_context&) override
-		{
-		}
-	};
-
-	class about_view final : public pf::frame_reactor
-	{
-		sysmate_theme& _theme;
-		std::vector<std::pair<std::string, std::string>> _rows;
-		pf::window_frame_ptr _window;
-		pf::ui::custom_scrollbar _scroll{pf::ui::custom_scrollbar::orientation::vertical};
-		pf::bitmap_ptr _icon;
-		pf::isize _extent;
-		int _content_height = 0;
-		std::function<void(bool)> _on_tab;
-
-		int scale(const int value) const
-		{
-			return sysmate::ui::scale(value, _theme.dpi_scale);
-		}
-
-		void update_scroll()
-		{
-			_scroll.set_dpi_scale(_theme.dpi_scale);
-			_scroll.update(_content_height, _extent.cy, _scroll_position);
-		}
-
-		int _scroll_position = 0;
-
-		void scroll_to(const int position)
-		{
-			const auto next = std::clamp(position, 0, std::max(0, _content_height - _extent.cy));
-			if (next != _scroll_position)
-			{
-				_scroll_position = next;
-				update_scroll();
-			}
-		}
-
-	public:
-		explicit about_view(sysmate_theme& theme) : _theme(theme)
-		{
-			const auto data = pf::embedded_resource_data("sys-mate.ico");
-			if (!data.empty())
-				_icon = pf::load_bitmap_memory(data.data(), data.size());
-		}
-
-		void set_rows(std::vector<std::pair<std::string, std::string>> rows)
-		{
-			_rows = std::move(rows);
-			_content_height = scale(28) * 2 + scale(46 + 28 + 36 + 20) +
-				static_cast<int>(_rows.size()) * scale(26);
-			update_scroll();
-			if (_window) _window->invalidate();
-		}
-
-		void set_on_tab(std::function<void(bool)> callback)
-		{
-			_on_tab = std::move(callback);
-		}
-
-		uint32_t handle_message(pf::window_frame_ptr window,
-		                       const pf::message_type message,
-		                       const pf::message_params& params) override
-		{
-			_window = window;
-			if (message == pf::message_type::erase_background) return 1;
-			if (message == pf::message_type::dpi_changed)
-			{
-				_theme.set_dpi(params.dpi_scale);
-				_content_height = scale(28) * 2 + scale(46 + 28 + 36 + 20) +
-					static_cast<int>(_rows.size()) * scale(26);
-				update_scroll();
-				window->invalidate();
-			}
-			return 0;
-		}
-
-		uint32_t handle_mouse(pf::window_frame_ptr window,
-		                      const pf::mouse_message_type message,
-		                      const pf::mouse_params& params) override
-		{
-			const auto client = window->get_client_rect();
-			const auto scrollbar_client = pf::irect(0, 0, client.right, client.bottom);
-			if (message == pf::mouse_message_type::mouse_wheel)
-			{
-				scroll_to(_scroll_position - params.wheel_delta / 120 * scale(26));
-				window->invalidate();
-				return 1;
-			}
-
-			if (_scroll.handle_mouse(message, params.point, scrollbar_client, window,
-			                         [this, &window](const int position)
-			                         {
-				                         scroll_to(position);
-				                         window->invalidate();
-			                         }))
-			{
-				window->invalidate();
-				return 1;
-			}
-			if (message == pf::mouse_message_type::left_button_down)
-			{
-				window->set_focus();
-				return 1;
-			}
-			if (message == pf::mouse_message_type::set_cursor)
-			{
-				window->set_cursor_shape(pf::cursor_shape::arrow);
-				return 1;
-			}
-			return 0;
-		}
-
-		uint32_t handle_keyboard(pf::window_frame_ptr window,
-		                         const pf::keyboard_message_type message,
-		                         const pf::keyboard_params& params) override
-		{
-			if (message != pf::keyboard_message_type::key_down) return 0;
-			if (params.vk == pf::platform_key::Tab)
-			{
-				if (_on_tab) _on_tab(window->is_key_down(pf::platform_key::Shift));
-				return 1;
-			}
-
-			const auto line = scale(26);
-			switch (params.vk)
-			{
-			case pf::platform_key::Up: scroll_to(_scroll_position - line); break;
-			case pf::platform_key::Down: scroll_to(_scroll_position + line); break;
-			case pf::platform_key::Prior: scroll_to(_scroll_position - _extent.cy); break;
-			case pf::platform_key::Next: scroll_to(_scroll_position + _extent.cy); break;
-			case pf::platform_key::Home: scroll_to(0); break;
-			case pf::platform_key::End: scroll_to(_content_height); break;
-			default: return 0;
-			}
-			window->invalidate();
-			return 1;
-		}
-
-		void handle_paint(pf::window_frame_ptr& window, pf::draw_context& dc) override
-		{
-			const auto client = window->get_client_rect();
-			dc.fill_solid_rect(client, _theme.window_background);
-			update_scroll();
-
-			const auto content_right = _scroll.can_scroll()
-			                               ? client.right - scale(8) : client.right;
-			const auto left = scale(28);
-			const auto right = content_right - scale(28);
-			int y = scale(28) - _scroll_position;
-
-			if (_icon)
-				dc.draw_bitmap({left, y, left + scale(64), y + scale(64)}, *_icon);
-
-			const auto text_left = left + scale(64 + 16);
-			const auto title_font = pf::font{scale(32), pf::font_name::calibri};
-			const auto subtitle_font = pf::font{scale(18), pf::font_name::calibri};
-			const auto body_font = _theme.list_font;
-			draw_text(dc, "SysMate", title_font, _theme.text, _theme.window_background,
-			          {text_left, y, right, y + scale(42)});
-			y += scale(46);
-			draw_text(dc, "Version 2.0 - System Information Utility", subtitle_font,
-			          _theme.dim_text, _theme.window_background,
-			          {text_left, y, right, y + scale(24)});
-			y += scale(28);
-			draw_text(dc, "Copyright (C) 2002 Zac Walker", body_font,
-			          _theme.dim_text, _theme.window_background,
-			          {text_left, y, right, y + scale(20)});
-			y += scale(36);
-			dc.fill_solid_rect(left, y, right - left, scale(1), _theme.handle);
-			y += scale(20);
-
-			const auto label_width = scale(170);
-			const auto value_left = left + scale(180);
-			for (const auto& [label, value] : _rows)
-			{
-				draw_text(dc, label, body_font, _theme.dim_text, _theme.window_background,
-				          {left, y, left + label_width, y + scale(22)});
-				draw_text(dc, value, body_font, _theme.text, _theme.window_background,
-				          {value_left, y, right, y + scale(22)});
-				y += scale(26);
-			}
-			_scroll.draw(dc, {0, 0, client.right, client.bottom});
-		}
-
-		void handle_size(pf::window_frame_ptr&, const pf::isize extent,
-		                 pf::measure_context&) override
-		{
-			_extent = extent;
-			update_scroll();
-		}
-	};
-
-	class main_reactor final : public pf::frame_reactor,
-	                           public std::enable_shared_from_this<main_reactor>
-	{
-		pf::window_frame_ptr _frame;
 		sysmate_theme _theme;
+		platform::setting_file_ptr _settings;
+		ui::frame_ptr _frame;
+		std::shared_ptr<dashboard_element> _root;
+		ui::control_ptr _menu_bar;
+		std::vector<ui::command_ptr> _menus;
+		ui::command_ptr _focus_filter_command;
+		std::array<ui::button_ptr, sysmate::ui::tab_count> _tab_buttons;
+		std::array<ui::button_ptr, 3> _action_buttons;
+		ui::edit_ptr _filter_edit;
+
 		sysmate::native::performance_monitor _monitor;
 		sysmate::native::hardware_info _hardware;
 		sysmate::native::performance_sample _sample;
 		std::array<std::deque<float>, chart_count> _history;
 		std::array<Chart, chart_count> _charts;
+		std::array<core::surface_ptr, chart_count> _chart_surfaces;
 		double _network_peak = 1024.0 * 1024.0;
 		uint64_t _handle_peak = 10000;
 
 		tab_id _tab = tab_id::performance;
 		std::array<std::string, sysmate::ui::tab_count> _filters;
-		sysmate::ui::focus_model _focus;
-		int _action_focus = 0;
-		int _hot_tab = -1;
-		int _hot_button = -1;
-
-		pf::window_frame_ptr _performance_frame;
-		pf::window_frame_ptr _process_frame;
-		pf::window_frame_ptr _module_frame;
-		pf::window_frame_ptr _network_frame;
-		pf::window_frame_ptr _window_frame;
-		pf::window_frame_ptr _property_frame;
-		pf::window_frame_ptr _about_frame;
-		pf::window_frame_ptr _filter_frame;
-
-		std::shared_ptr<performance_view> _performance_view;
+		std::shared_ptr<performance_element> _performance;
 		std::shared_ptr<table_view> _process_view;
 		std::shared_ptr<table_view> _module_view;
 		std::shared_ptr<table_view> _network_view;
 		std::shared_ptr<table_view> _window_view;
 		std::shared_ptr<table_view> _property_view;
-		std::shared_ptr<about_view> _about_view;
-		std::shared_ptr<filter_view> _filter_view;
+		std::shared_ptr<about_element> _about;
+
 		bool _offscreen_test = false;
 		bool _ui_test = false;
+		bool _ui_test_done = false;
 		int _offscreen_step = 0;
 		uint64_t _offscreen_selected = 0;
 		bool _offscreen_ok = true;
 		std::vector<std::shared_ptr<process_info>> _ui_process_fixture;
 		std::vector<std::shared_ptr<network_connection>> _ui_network_fixture;
 		std::vector<std::shared_ptr<window_info>> _ui_window_fixture;
-
-		static constexpr pf::color_t accent{0, 150, 230};
-		static constexpr uint32_t offscreen_timer = 2;
-		static constexpr uint32_t ui_test_timer = 3;
-
-		[[nodiscard]] sysmate::ui::extent client_extent() const
-		{
-			const auto client = _frame->get_client_rect();
-			return {client.width(), client.height()};
-		}
+		double _last_sample = 0.0;
+		bool _sampled_once = false;
+		double _dpi_scale = 1.0;
 
 		[[nodiscard]] bool has_filter() const
 		{
-			return _tab == tab_id::processes || _tab == tab_id::network ||
-				_tab == tab_id::windows;
+			return _tab == tab_id::processes || _tab == tab_id::network || _tab == tab_id::windows;
 		}
 
-		[[nodiscard]] std::vector<pf::menu_command> popup_for_process(
-			const std::shared_ptr<void>& payload)
+		[[nodiscard]] core::recti offset_rect(const sysmate::ui::rect& rect, const int top) const
 		{
-			const auto process = std::static_pointer_cast<process_info>(payload);
-			if (!process) return {};
-			std::weak_ptr<main_reactor> weak = shared_from_this();
-			return {
-				pf::menu_command("Show in Explorer", 1,
-				                 [weak, process]
-				                 {
-					                 if (const auto self = weak.lock())
-						                 self->show_process(process);
-				                 },
-				                 [process] { return !process->path.empty(); }),
-				pf::menu_command("Kill Process", 2,
-				                 [weak, process]
-				                 {
-					                 if (const auto self = weak.lock())
-						                 self->kill_process(process);
-				                 })};
+			return {rect.left, rect.top + top, rect.right, rect.bottom + top};
 		}
 
-		[[nodiscard]] std::vector<pf::menu_command> popup_for_module(
-			const std::shared_ptr<void>& payload)
+		ui::command_ptr command(std::string_view text, std::function<void()> invoke,
+		                       std::initializer_list<platform::keyboard_accelerator_t> kba = {})
 		{
-			const auto module = std::static_pointer_cast<sysmate::native::module_info>(payload);
-			if (!module) return {};
-			std::weak_ptr<main_reactor> weak = shared_from_this();
-			return {pf::menu_command("Show in Explorer", 1,
-				[weak, module]
-				{
-					if (const auto self = weak.lock()) self->show_module(module);
-				})};
+			auto result = std::make_shared<ui::command>();
+			result->text = text;
+			result->invoke = std::move(invoke);
+			result->kba.assign(kba.begin(), kba.end());
+			return result;
 		}
 
-		[[nodiscard]] std::vector<pf::menu_command> popup_for_window(
-			const std::shared_ptr<void>& payload)
-		{
-			const auto window = std::static_pointer_cast<window_info>(payload);
-			if (!window) return {};
-			std::weak_ptr<main_reactor> weak = shared_from_this();
-			return {
-				pf::menu_command("Show in Explorer", 1,
-				                 [weak, window]
-				                 {
-					                 if (const auto self = weak.lock())
-						                 self->show_window_process(window);
-				                 }),
-				pf::menu_command("Close Window", 2,
-				                 [weak, window]
-				                 {
-					                 if (const auto self = weak.lock())
-						                 self->close_window(window);
-				                 })};
-		}
-
-		void create_children(const pf::window_frame_ptr& window)
-		{
-			const std::weak_ptr<main_reactor> weak = shared_from_this();
-
-			_performance_frame = window->create_child("SysMatePerformance",
-				pf::window_style::child | pf::window_style::visible |
-				pf::window_style::clip_children, _theme.window_background);
-			_performance_view = std::make_shared<performance_view>(
-				[weak](pf::draw_context& dc, const pf::irect bounds)
-				{
-					if (const auto self = weak.lock()) self->paint_performance(dc, bounds);
-				});
-			_performance_frame->set_reactor(_performance_view);
-
-			_process_frame = window->create_child("SysMateProcesses",
-				pf::window_style::child | pf::window_style::clip_children,
-				_theme.tool_background);
-			_process_view = std::make_shared<table_view>(_theme,
-				std::vector<pf::ui::list_column>{
-					{"Name", 200}, {"PID", 70, true}, {"Memory", 100, true}});
-			_process_view->set_on_selection([weak](const std::shared_ptr<void>& data)
-			{
-				if (const auto self = weak.lock()) self->process_selected(data);
-			});
-			_process_view->set_popup([weak](const std::shared_ptr<void>& data)
-			{
-				return weak.expired() ? std::vector<pf::menu_command>{}
-				                      : weak.lock()->popup_for_process(data);
-			});
-			_process_view->set_on_tab([weak](const bool reverse)
-			{
-				if (const auto self = weak.lock()) self->focus_from_table(reverse);
-			});
-			_process_frame->set_reactor(_process_view);
-
-			_module_frame = window->create_child("SysMateModules",
-				pf::window_style::child | pf::window_style::clip_children,
-				_theme.tool_background);
-			_module_view = std::make_shared<table_view>(_theme,
-				std::vector<pf::ui::list_column>{
-					{"Module", 180}, {"Path", 300}, {"Size", 80, true}});
-			_module_view->set_empty_text("Modules unavailable (access denied)");
-			_module_view->set_popup([weak](const std::shared_ptr<void>& data)
-			{
-				return weak.expired() ? std::vector<pf::menu_command>{}
-				                      : weak.lock()->popup_for_module(data);
-			});
-			_module_view->set_on_tab([weak](const bool reverse)
-			{
-				if (const auto self = weak.lock()) self->focus_from_table(reverse);
-			});
-			_module_frame->set_reactor(_module_view);
-
-			_network_frame = window->create_child("SysMateNetwork",
-				pf::window_style::child | pf::window_style::clip_children,
-				_theme.tool_background);
-			_network_view = std::make_shared<table_view>(_theme,
-				std::vector<pf::ui::list_column>{
-					{"Proto", 60}, {"Local Address", 190}, {"Remote Address", 190},
-					{"State", 110}, {"PID", 70, true}, {"Process", 160}});
-			_network_view->set_on_tab([weak](const bool reverse)
-			{
-				if (const auto self = weak.lock()) self->focus_from_table(reverse);
-			});
-			_network_frame->set_reactor(_network_view);
-
-			_window_frame = window->create_child("SysMateWindows",
-				pf::window_style::child | pf::window_style::clip_children,
-				_theme.tool_background);
-			_window_view = std::make_shared<table_view>(_theme,
-				std::vector<pf::ui::list_column>{
-					{"Title", 250}, {"Class", 150}, {"PID", 70, true}, {"Handle", 100}});
-			_window_view->set_on_selection([weak](const std::shared_ptr<void>& data)
-			{
-				if (const auto self = weak.lock()) self->window_selected(data);
-			});
-			_window_view->set_popup([weak](const std::shared_ptr<void>& data)
-			{
-				return weak.expired() ? std::vector<pf::menu_command>{}
-				                      : weak.lock()->popup_for_window(data);
-			});
-			_window_view->set_on_tab([weak](const bool reverse)
-			{
-				if (const auto self = weak.lock()) self->focus_from_table(reverse);
-			});
-			_window_frame->set_reactor(_window_view);
-
-			_property_frame = window->create_child("SysMateWindowProperties",
-				pf::window_style::child | pf::window_style::clip_children,
-				_theme.tool_background);
-			_property_view = std::make_shared<table_view>(_theme,
-				std::vector<pf::ui::list_column>{{"Property", 120}, {"Value", 300}});
-			_property_view->set_on_tab([weak](const bool reverse)
-			{
-				if (const auto self = weak.lock()) self->focus_from_table(reverse);
-			});
-			_property_frame->set_reactor(_property_view);
-
-			_about_frame = window->create_child("SysMateAbout",
-				pf::window_style::child | pf::window_style::clip_children,
-				_theme.window_background);
-			_about_view = std::make_shared<about_view>(_theme);
-			_about_view->set_on_tab([weak](const bool reverse)
-			{
-				if (const auto self = weak.lock()) self->focus_from_table(reverse);
-			});
-			_about_frame->set_reactor(_about_view);
-
-			_filter_frame = window->create_child("SysMateFilter",
-				pf::window_style::child | pf::window_style::clip_children,
-				_theme.tool_background);
-			_filter_view = std::make_shared<filter_view>(_theme);
-			_filter_view->set_on_change([weak](const std::string_view text)
-			{
-				if (const auto self = weak.lock()) self->filter_changed(text);
-			});
-			_filter_view->set_on_tab([weak](const bool reverse)
-			{
-				if (const auto self = weak.lock()) self->focus_from_filter(reverse);
-			});
-			_filter_frame->set_reactor(_filter_view);
-
-			_module_view->set_rows({});
-			_property_view->set_rows({});
-			_show_active_tab();
-		}
-
-		void _show_active_tab()
-		{
-			if (!_frame) return;
-			_performance_frame->show(_tab == tab_id::performance);
-			_process_frame->show(_tab == tab_id::processes);
-			_module_frame->show(_tab == tab_id::processes);
-			_network_frame->show(_tab == tab_id::network);
-			_window_frame->show(_tab == tab_id::windows);
-			_property_frame->show(_tab == tab_id::windows);
-			_about_frame->show(_tab == tab_id::about);
-			_filter_frame->show(has_filter());
-		}
-
-		void layout_children()
-		{
-			if (!_frame) return;
-			const auto client = _frame->get_client_rect();
-			const auto l = sysmate::ui::make_layout(
-				{client.width(), client.height()}, _frame->get_dpi_scale(), _tab);
-
-			if (_performance_frame) _performance_frame->move_window(
-				{l.page.left, l.page.top, l.page.right, l.page.bottom});
-			if (_network_frame) _network_frame->move_window(
-				{l.page.left, l.page.top, l.page.right, l.page.bottom});
-			if (_about_frame) _about_frame->move_window(
-				{l.page.left, l.page.top, l.page.right, l.page.bottom});
-			if (_process_frame) _process_frame->move_window(
-				{l.primary_pane.left, l.primary_pane.top,
-				 l.primary_pane.right, l.primary_pane.bottom});
-			if (_module_frame) _module_frame->move_window(
-				{l.secondary_pane.left, l.secondary_pane.top,
-				 l.secondary_pane.right, l.secondary_pane.bottom});
-			if (_window_frame) _window_frame->move_window(
-				{l.primary_pane.left, l.primary_pane.top,
-				 l.primary_pane.right, l.primary_pane.bottom});
-			if (_property_frame) _property_frame->move_window(
-				{l.secondary_pane.left, l.secondary_pane.top,
-				 l.secondary_pane.right, l.secondary_pane.bottom});
-			if (_filter_frame)
-			{
-				_filter_frame->move_window({l.filter.left, l.filter.top,
-				                            l.filter.right, l.filter.bottom});
-				_filter_frame->show(l.filter_visible);
-			}
-			_show_active_tab();
-		}
-
-		void focus_current_page()
-		{
-			switch (_tab)
-			{
-			case tab_id::processes: if (_process_frame) _process_frame->set_focus(); break;
-			case tab_id::network: if (_network_frame) _network_frame->set_focus(); break;
-			case tab_id::windows: if (_window_frame) _window_frame->set_focus(); break;
-			case tab_id::about: if (_about_frame) _about_frame->set_focus(); break;
-			case tab_id::performance: if (_performance_frame) _performance_frame->set_focus(); break;
-			}
-		}
-
-		void focus_from_filter(const bool reverse)
-		{
-			if (reverse) _frame->set_focus();
-			else focus_current_page();
-			_focus.target = reverse ? sysmate::ui::focus_target::tabs
-			                        : sysmate::ui::focus_target::table;
-		}
-
-		void focus_from_table(const bool reverse)
-		{
-			if (reverse)
-			{
-				if (has_filter()) _filter_frame->set_focus();
-				else _frame->set_focus();
-				_focus.target = has_filter() ? sysmate::ui::focus_target::filter
-				                             : sysmate::ui::focus_target::tabs;
-			}
-			else
-			{
-				_frame->set_focus();
-				_focus.target = _tab == tab_id::performance
-				                    ? sysmate::ui::focus_target::tabs
-				                    : sysmate::ui::focus_target::actions;
-				_action_focus = 0;
-			}
-		}
-
-		void focus_by_tab()
-		{
-			switch (_focus.target)
-			{
-			case sysmate::ui::focus_target::tabs: _frame->set_focus(); break;
-			case sysmate::ui::focus_target::filter:
-				if (has_filter()) _filter_view->focus_select_all(_filter_frame);
-				else focus_current_page();
-				break;
-			case sysmate::ui::focus_target::table: focus_current_page(); break;
-			case sysmate::ui::focus_target::actions: _frame->set_focus(); break;
-			}
-		}
-
-		void filter_changed(const std::string_view text)
-		{
-			_filters[static_cast<size_t>(_tab)] = std::string(text);
-			refresh_current();
-		}
+		std::weak_ptr<sysmate_app> weak_self() { return std::enable_shared_from_this<sysmate_app>::weak_from_this(); }
 
 		void initialize_ui_fixture()
 		{
 			if (!_ui_test) return;
-
 			auto first = std::make_shared<process_info>();
 			first->pid = 41001;
 			first->created = 1001;
@@ -1296,8 +693,7 @@ namespace
 			const auto add = [&rows](const std::shared_ptr<process_info>& process)
 			{
 				rows.push_back({process_identity(*process),
-					{process->name, std::format("{}", process->pid), format_bytes(process->working_set)},
-					process});
+					{process->name, std::format("{}", process->pid), format_bytes(process->working_set)}, process});
 			};
 			if (_ui_test)
 			{
@@ -1311,9 +707,7 @@ namespace
 			_process_view->set_empty_text(_filters[1].empty() ? "Empty" : "No matching items");
 			_process_view->set_filter(_filters[1]);
 			_process_view->set_rows(std::move(rows));
-
-			if (const auto process = std::static_pointer_cast<process_info>(
-				    _process_view->selected_data()))
+			if (const auto process = std::static_pointer_cast<process_info>(_process_view->selected_data()))
 				refresh_modules(process->pid);
 			else
 				_module_view->set_rows({});
@@ -1339,8 +733,7 @@ namespace
 			{
 				rows.push_back({network_identity(*connection),
 					{connection->protocol, connection->local_address, connection->remote_address,
-					 connection->state, std::format("{}", connection->pid), connection->process_name},
-					connection});
+					 connection->state, std::format("{}", connection->pid), connection->process_name}, connection});
 			};
 			if (_ui_test)
 			{
@@ -1362,10 +755,8 @@ namespace
 			const auto add = [&rows](const std::shared_ptr<window_info>& window)
 			{
 				rows.push_back({window_identity(*window),
-					{window->title.empty() ? window->class_name : window->title,
-					 window->class_name, std::format("{}", window->pid),
-					 std::format("0x{:X}", window->window_id)},
-					window});
+					{window->title.empty() ? window->class_name : window->title, window->class_name,
+					 std::format("{}", window->pid), std::format("0x{:X}", window->window_id)}, window});
 			};
 			if (_ui_test)
 			{
@@ -1382,18 +773,13 @@ namespace
 			window_selected(_window_view->selected_data());
 		}
 
-		void refresh_about()
-		{
-			_about_view->set_rows(sysmate::native::collect_system_summary(_hardware));
-		}
+		void refresh_about() { _about->set_rows(sysmate::native::collect_system_summary(_hardware)); }
 
 		void refresh_current()
 		{
 			switch (_tab)
 			{
-			case tab_id::performance:
-				if (_performance_frame) _performance_frame->invalidate();
-				break;
+			case tab_id::performance: if (_frame) _frame->invalidate(); break;
 			case tab_id::processes: refresh_processes(); break;
 			case tab_id::network: refresh_network(); break;
 			case tab_id::windows: refresh_windows(); break;
@@ -1423,8 +809,8 @@ namespace
 				add("PID", std::format("{}", window->pid));
 				add("Thread ID", std::format("{}", window->tid));
 				add("Handle", std::format("0x{:X}", window->window_id));
-				add("Rect", std::format("{}, {}, {}, {}", window->bounds.left,
-					window->bounds.top, window->bounds.right, window->bounds.bottom));
+				add("Rect", std::format("{}, {}, {}, {}", window->bounds.left, window->bounds.top,
+					window->bounds.right, window->bounds.bottom));
 				add("Size", std::format("{} x {}", window->bounds.right - window->bounds.left,
 					window->bounds.bottom - window->bounds.top));
 				add("Style", format_hex(window->style));
@@ -1435,13 +821,18 @@ namespace
 
 		void show_error(const std::string_view text)
 		{
-			if (_frame) _frame->message_box(text, "SysMate",
-				pf::msg_box_style::ok | pf::msg_box_style::icon_warning);
+			platform::message_box(nullptr, text, "SysMate",
+				{platform::message_box_buttons::ok, platform::message_box_icon::warning});
 		}
 
 		void show_process(const std::shared_ptr<process_info>& process)
 		{
 			if (!process) return;
+			if (process->path.empty())
+			{
+				show_error("The process path is unavailable.");
+				return;
+			}
 			std::string error;
 			if (!sysmate::native::show_process_in_explorer(*process, error)) show_error(error);
 		}
@@ -1449,11 +840,11 @@ namespace
 		void kill_process(const std::shared_ptr<process_info>& process)
 		{
 			if (!process) return;
-			const auto answer = _frame->message_box(
+			const auto answer = platform::message_box(nullptr,
 				std::format("Terminate {} (PID {})?\n\nUnsaved work in this process will be lost.",
-				            process->name, process->pid),
-				"SysMate", pf::msg_box_style::ok_cancel | pf::msg_box_style::icon_warning);
-			if (answer != pf::msg_box_result::ok) return;
+					process->name, process->pid), "SysMate",
+				{platform::message_box_buttons::ok_cancel, platform::message_box_icon::warning});
+			if (answer != platform::message_box_result::ok) return;
 			std::string error;
 			if (!sysmate::native::terminate_process(*process, error)) show_error(error);
 			refresh_processes();
@@ -1462,28 +853,26 @@ namespace
 		void show_module(const std::shared_ptr<sysmate::native::module_info>& module)
 		{
 			if (!module || module->path.empty()) return;
-			const auto process = std::make_shared<process_info>();
-			process->path = module->path;
+			process_info process;
+			process.path = module->path;
 			std::string error;
-			if (!sysmate::native::show_process_in_explorer(*process, error)) show_error(error);
+			if (!sysmate::native::show_process_in_explorer(process, error)) show_error(error);
 		}
 
 		void show_window_process(const std::shared_ptr<window_info>& window)
 		{
 			if (!window) return;
 			std::string error;
-			if (!sysmate::native::show_window_process_in_explorer(*window, error))
-				show_error(error);
+			if (!sysmate::native::show_window_process_in_explorer(*window, error)) show_error(error);
 		}
 
 		void close_window(const std::shared_ptr<window_info>& window)
 		{
 			if (!window) return;
 			const auto title = window->title.empty() ? window->class_name : window->title;
-			const auto answer = _frame->message_box(
-				std::format("Close \"{}\"?", title), "SysMate",
-				pf::msg_box_style::ok_cancel | pf::msg_box_style::icon_warning);
-			if (answer != pf::msg_box_result::ok) return;
+			const auto answer = platform::message_box(nullptr, std::format("Close \"{}\"?", title), "SysMate",
+				{platform::message_box_buttons::ok_cancel, platform::message_box_icon::warning});
+			if (answer != platform::message_box_result::ok) return;
 			std::string error;
 			if (!sysmate::native::close_window(*window, error)) show_error(error);
 		}
@@ -1491,11 +880,9 @@ namespace
 		void copy_about()
 		{
 			const auto rows = sysmate::native::collect_system_summary(_hardware);
-			std::string text = "SysMate - System Information\r\n";
-			text += "================================\r\n";
-			for (const auto& [label, value] : rows)
-				text += std::format("{}: {}\r\n", label, value);
-			if (!_frame->text_to_clipboard(text)) show_error("The clipboard is unavailable.");
+			std::string text = "SysMate - System Information\r\n================================\r\n";
+			for (const auto& [label, value] : rows) text += std::format("{}: {}\r\n", label, value);
+			if (!platform::set_clipboard(text)) show_error("The clipboard is unavailable.");
 		}
 
 		void report_issue()
@@ -1504,33 +891,114 @@ namespace
 			if (!sysmate::native::open_issue_url(error)) show_error(error);
 		}
 
+		std::vector<ui::command_ptr> popup_for_process(const std::shared_ptr<void>& payload)
+		{
+			const auto process = std::static_pointer_cast<process_info>(payload);
+			if (!process) return {};
+			const auto weak = weak_self();
+			auto show = command("Show in Explorer", [weak, process]
+			{
+				if (const auto self = weak.lock()) self->show_process(process);
+			});
+			show->enable = !process->path.empty();
+			return {std::move(show), command("Kill Process", [weak, process]
+			{
+				if (const auto self = weak.lock()) self->kill_process(process);
+			})};
+		}
+
+		std::vector<ui::command_ptr> popup_for_module(const std::shared_ptr<void>& payload)
+		{
+			const auto module = std::static_pointer_cast<sysmate::native::module_info>(payload);
+			if (!module) return {};
+			const auto weak = weak_self();
+			return {command("Show in Explorer", [weak, module]
+			{
+				if (const auto self = weak.lock()) self->show_module(module);
+			})};
+		}
+
+		std::vector<ui::command_ptr> popup_for_window(const std::shared_ptr<void>& payload)
+		{
+			const auto window = std::static_pointer_cast<window_info>(payload);
+			if (!window) return {};
+			const auto weak = weak_self();
+			return {command("Show in Explorer", [weak, window]
+			{
+				if (const auto self = weak.lock()) self->show_window_process(window);
+			}), command("Close Window", [weak, window]
+			{
+				if (const auto self = weak.lock()) self->close_window(window);
+			})};
+		}
+
+
 		void action(const int index)
 		{
 			switch (_tab)
 			{
 			case tab_id::processes:
 				if (index == 0) refresh_processes();
-				else if (index == 1) show_process(std::static_pointer_cast<process_info>(
-					_process_view->selected_data()));
-				else if (index == 2) kill_process(std::static_pointer_cast<process_info>(
-					_process_view->selected_data()));
+				else if (index == 1) show_process(std::static_pointer_cast<process_info>(_process_view->selected_data()));
+				else if (index == 2) kill_process(std::static_pointer_cast<process_info>(_process_view->selected_data()));
 				break;
-			case tab_id::network:
-				if (index == 0) refresh_network();
-				break;
+			case tab_id::network: if (index == 0) refresh_network(); break;
 			case tab_id::windows:
 				if (index == 0) refresh_windows();
-				else if (index == 1) show_window_process(std::static_pointer_cast<window_info>(
-					_window_view->selected_data()));
-				else if (index == 2) close_window(std::static_pointer_cast<window_info>(
-					_window_view->selected_data()));
+				else if (index == 1) show_window_process(std::static_pointer_cast<window_info>(_window_view->selected_data()));
+				else if (index == 2) close_window(std::static_pointer_cast<window_info>(_window_view->selected_data()));
 				break;
 			case tab_id::about:
 				if (index == 0) report_issue();
 				else if (index == 1) copy_about();
 				else if (index == 2) refresh_about();
 				break;
+			case tab_id::performance: break;
+			}
+		}
+
+		void update_visibility()
+		{
+			const auto process = _tab == tab_id::processes;
+			const auto network = _tab == tab_id::network;
+			const auto windows = _tab == tab_id::windows;
+			const auto about = _tab == tab_id::about;
+			_performance->is_visible(_tab == tab_id::performance);
+			_process_view->is_visible(process);
+			_module_view->is_visible(process);
+			_network_view->is_visible(network);
+			_window_view->is_visible(windows);
+			_property_view->is_visible(windows);
+			_about->is_visible(about);
+			_filter_edit->is_visible(has_filter());
+			if (_focus_filter_command) _focus_filter_command->enable = has_filter();
+			for (int i = 0; i < sysmate::ui::tab_count; ++i)
+				_tab_buttons[i]->set_checked(i == static_cast<int>(_tab));
+
+			static constexpr std::array<std::array<std::string_view, 3>, 5> labels = {{
+				{{"", "", ""}},
+				{{"Refresh", "Open in Explorer", "Kill Process"}},
+				{{"Refresh", "", ""}},
+				{{"Refresh", "Open in Explorer", "Close Window"}},
+				{{"Report an Issue", "Copy to Clipboard", "Refresh"}}}};
+			const auto& current_labels = labels[static_cast<size_t>(_tab)];
+			for (size_t i = 0; i < _action_buttons.size(); ++i)
+			{
+				_action_buttons[i]->window_text(current_labels[i]);
+				_action_buttons[i]->is_visible(!current_labels[i].empty());
+			}
+		}
+
+		void focus_current_page()
+		{
+			switch (_tab)
+			{
+			case tab_id::processes: _process_view->focus(); break;
+			case tab_id::network: _network_view->focus(); break;
+			case tab_id::windows: _window_view->focus(); break;
 			case tab_id::performance:
+			case tab_id::about:
+				if (_frame) _frame->focus();
 				break;
 			}
 		}
@@ -1540,161 +1008,109 @@ namespace
 			if (index < 0 || index >= sysmate::ui::tab_count) return;
 			const auto next = static_cast<tab_id>(index);
 			if (next == _tab) return;
-			if (_filter_view && has_filter())
-				_filters[static_cast<size_t>(_tab)] = _filter_view->text();
+			if (_filter_edit && has_filter()) _filters[static_cast<size_t>(_tab)] = _filter_edit->window_text();
 			_tab = next;
-			if (_filter_view)
-			{
-				_filter_view->set_text(_filters[static_cast<size_t>(_tab)]);
-				_filter_frame->show(has_filter());
-			}
-			_focus.target = has_filter() ? sysmate::ui::focus_target::filter
-			                             : sysmate::ui::focus_target::table;
-			_action_focus = 0;
-			layout_children();
+			if (_filter_edit) _filter_edit->window_text(_filters[static_cast<size_t>(_tab)]);
+			update_visibility();
+			if (_frame) _frame->layout();
 			refresh_current();
 			focus_current_page();
 		}
 
-		[[nodiscard]] std::vector<pf::menu_command> menu()
+		std::vector<ui::command_ptr> make_menu()
 		{
-			const auto weak = weak_from_this();
-			std::vector<pf::menu_command> view;
-			view.emplace_back("Performance", 1100, [weak] { if (auto s = weak.lock()) s->switch_tab(0); },
-			                  nullptr, nullptr, pf::key_binding{'1', pf::key_mod::ctrl});
-			view.emplace_back("Processes", 1101, [weak] { if (auto s = weak.lock()) s->switch_tab(1); },
-			                  nullptr, nullptr, pf::key_binding{'2', pf::key_mod::ctrl});
-			view.emplace_back("Network", 1102, [weak] { if (auto s = weak.lock()) s->switch_tab(2); },
-			                  nullptr, nullptr, pf::key_binding{'3', pf::key_mod::ctrl});
-			view.emplace_back("Windows", 1103, [weak] { if (auto s = weak.lock()) s->switch_tab(3); },
-			                  nullptr, nullptr, pf::key_binding{'4', pf::key_mod::ctrl});
-			view.emplace_back("About", 1104, [weak] { if (auto s = weak.lock()) s->switch_tab(4); },
-			                  nullptr, nullptr, pf::key_binding{'5', pf::key_mod::ctrl});
+			const auto weak = weak_self();
+			auto refresh = command("&Refresh", [weak]
+			{
+				if (const auto self = weak.lock()) self->refresh_current();
+			}, {{platform::keys::F5, 0}, {'R', platform::keyboard_accelerator_t::control}});
+			auto quit = command("E&xit", [weak]
+			{
+				if (const auto self = weak.lock(); self && self->_frame) self->_frame->close();
+			});
+			auto file = std::make_shared<ui::command>();
+			file->text = "&File";
+			file->menu = [refresh, quit] { return std::vector<ui::command_ptr>{refresh, nullptr, quit}; };
 
-			pf::menu_command file;
-			file.text = "File";
-			file.children.emplace_back("Refresh", 1000,
-				[weak] { if (auto s = weak.lock()) s->refresh_current(); },
-				nullptr, nullptr,
-				pf::key_binding{pf::platform_key::F5, pf::key_mod::none},
-				pf::key_binding{'R', pf::key_mod::ctrl});
-			file.children.emplace_back();
-			file.children.emplace_back("Exit", 1001,
-				[weak]
+			std::vector<ui::command_ptr> tabs;
+			for (int i = 0; i < sysmate::ui::tab_count; ++i)
+			{
+				auto item = command(tab_names[i], [weak, i]
 				{
-					if (const auto s = weak.lock(); s && s->_frame) s->_frame->close();
-				});
-
-			pf::menu_command tabs;
-			tabs.text = "View";
-			tabs.children = std::move(view);
-			tabs.children.emplace_back();
-			tabs.children.emplace_back("Next Tab", 1010,
-				[weak] { if (auto s = weak.lock()) s->switch_tab((static_cast<int>(s->_tab) + 1) % 5); },
-				nullptr, nullptr,
-				pf::key_binding{pf::platform_key::Tab, pf::key_mod::ctrl},
-				pf::key_binding{pf::platform_key::Next, pf::key_mod::ctrl});
-			tabs.children.emplace_back("Previous Tab", 1011,
-				[weak] { if (auto s = weak.lock()) s->switch_tab((static_cast<int>(s->_tab) + 4) % 5); },
-				nullptr, nullptr,
-				pf::key_binding{pf::platform_key::Tab, pf::key_mod::ctrl | pf::key_mod::shift},
-				pf::key_binding{pf::platform_key::Prior, pf::key_mod::ctrl});
-			tabs.children.emplace_back("Focus Filter", 1012,
-				[weak]
+					if (const auto self = weak.lock()) self->switch_tab(i);
+				}, {{static_cast<char32_t>('1' + i), platform::keyboard_accelerator_t::control}});
+				tabs.push_back(std::move(item));
+			}
+			auto next = command("Next Tab", [weak]
+			{
+				if (const auto self = weak.lock()) self->switch_tab((static_cast<int>(self->_tab) + 1) % 5);
+			}, {{platform::keys::TAB, platform::keyboard_accelerator_t::control}});
+			next->kba.push_back({platform::keys::NEXT, platform::keyboard_accelerator_t::control});
+			auto previous = command("Previous Tab", [weak]
+			{
+				if (const auto self = weak.lock()) self->switch_tab((static_cast<int>(self->_tab) + 4) % 5);
+			}, {{platform::keys::TAB, platform::keyboard_accelerator_t::control |
+				platform::keyboard_accelerator_t::shift}});
+			previous->kba.push_back({platform::keys::PRIOR, platform::keyboard_accelerator_t::control});
+			auto focus_filter = command("Focus Filter", [weak]
+			{
+				if (const auto self = weak.lock(); self && self->has_filter() && self->_filter_edit)
 				{
-					if (const auto s = weak.lock(); s && s->has_filter())
-					{
-						s->_focus.target = sysmate::ui::focus_target::filter;
-						s->_filter_view->focus_select_all(s->_filter_frame);
-					}
-				},
-				[weak] { return !weak.expired() && weak.lock()->has_filter(); },
-				nullptr, pf::key_binding{'F', pf::key_mod::ctrl});
+					self->_filter_edit->focus();
+					self->_filter_edit->select_all();
+				}
+			}, {{'F', platform::keyboard_accelerator_t::control}});
+			_focus_filter_command = focus_filter;
+			focus_filter->enable = has_filter();
+			tabs.push_back(nullptr);
+			tabs.push_back(std::move(next));
+			tabs.push_back(std::move(previous));
+			tabs.push_back(std::move(focus_filter));
+			auto view = std::make_shared<ui::command>();
+			view->text = "&View";
+			view->menu = [tabs] { return tabs; };
 
-			pf::menu_command help;
-			help.text = "Help";
-			help.children.emplace_back("Report an Issue", 1020,
-				[weak] { if (auto s = weak.lock()) s->report_issue(); });
-			return {std::move(file), std::move(tabs), std::move(help)};
+			auto issue = command("Report an Issue", [weak]
+			{
+				if (const auto self = weak.lock()) self->report_issue();
+			});
+			auto help = std::make_shared<ui::command>();
+			help->text = "&Help";
+			help->menu = [issue] { return std::vector<ui::command_ptr>{issue}; };
+			return {std::move(file), std::move(view), std::move(help)};
 		}
 
-		void paint_tabs_and_bar(pf::draw_context& dc, const pf::irect client)
+		void layout_root(render::measure_context& mc, const core::recti bounds)
 		{
-			const auto l = sysmate::ui::make_layout(
-				{client.width(), client.height()}, _theme.dpi_scale, _tab);
-			dc.fill_solid_rect(client, _theme.window_background);
-
+			const auto menu_extent = _menu_bar->measure(mc, bounds.width());
+			const auto menu_height = std::max(1, menu_extent.cy);
+			_menu_bar->layout(mc, {0, 0, bounds.right, menu_height});
+			const auto content_height = std::max(0, bounds.height() - menu_height);
+			const auto l = sysmate::ui::make_layout({bounds.width(), content_height}, _theme.dpi_scale, _tab);
 			const auto tab_width = l.tabs.width() / sysmate::ui::tab_count;
 			for (int i = 0; i < sysmate::ui::tab_count; ++i)
 			{
-				const auto tab_rect = sysmate::ui::rect{
-					i * tab_width, l.tabs.top,
-					i == sysmate::ui::tab_count - 1 ? l.tabs.right : (i + 1) * tab_width,
-					l.tabs.bottom};
-				const auto selected = i == static_cast<int>(_tab);
-				const auto hot = i == _hot_tab && !selected;
-				if (selected) dc.fill_solid_rect(tab_rect.left, tab_rect.top,
-					tab_rect.width(), tab_rect.height(), _theme.handle);
-				else if (hot) dc.fill_solid_rect(tab_rect.left, tab_rect.top,
-					tab_rect.width(), tab_rect.height(), _theme.handle_hover);
-				if (selected) dc.fill_solid_rect(tab_rect.left, tab_rect.top,
-					tab_rect.width(), sysmate::ui::scale(2, _theme.dpi_scale), accent);
-				draw_centered_text(dc, tab_names[i], _theme.list_font,
-				                   selected ? _theme.text : _theme.dim_text,
-				                   selected ? _theme.handle : _theme.window_background,
-				                   tab_rect);
-			}
-			dc.fill_solid_rect(0, l.tabs.bottom - 1, client.right, 1, _theme.handle);
-
-			if (l.bottom_bar.height() <= 0) return;
-			dc.fill_solid_rect(l.bottom_bar.left, l.bottom_bar.top,
-			                   l.bottom_bar.width(), l.bottom_bar.height(),
-			                   _theme.tool_background);
-
-			std::vector<std::string_view> labels;
-			switch (_tab)
-			{
-			case tab_id::processes: labels = {"Refresh", "Open in Explorer", "Kill Process"}; break;
-			case tab_id::network: labels = {"Refresh"}; break;
-			case tab_id::windows: labels = {"Refresh", "Open in Explorer", "Close Window"}; break;
-			case tab_id::about: labels = {"Report an Issue", "Copy to Clipboard", "Refresh"}; break;
-			case tab_id::performance: break;
+				const auto right = i == sysmate::ui::tab_count - 1 ? l.tabs.right : (i + 1) * tab_width;
+				_tab_buttons[i]->layout(mc, offset_rect({i * tab_width, l.tabs.top, right, l.tabs.bottom}, menu_height));
 			}
 
-			for (size_t i = 0; i < l.buttons.size() && i < labels.size(); ++i)
-			{
-				const auto& button = l.buttons[i];
-				const auto selected = _hot_button == static_cast<int>(i);
-				const auto focused = _focus.target == sysmate::ui::focus_target::actions &&
-					_action_focus == static_cast<int>(i) && _frame && _frame->has_focus();
-				const auto background = selected ? _theme.handle_hover : _theme.handle;
-				dc.fill_solid_rect(button.left, button.top, button.width(), button.height(), background);
-				dc.draw_solid_line({button.left, button.top},
-				                   {button.right - 1, button.top}, _theme.line);
-				dc.draw_solid_line({button.left, button.bottom - 1},
-				                   {button.right - 1, button.bottom - 1}, _theme.line);
-				dc.draw_solid_line({button.left, button.top},
-				                   {button.left, button.bottom - 1}, _theme.line);
-				dc.draw_solid_line({button.right - 1, button.top},
-				                   {button.right - 1, button.bottom - 1}, _theme.line);
-				draw_centered_text(dc, labels[i], _theme.list_font, _theme.text, background, button);
-				if (focused)
-				{
-					dc.draw_solid_line({button.left + 2, button.top + 2},
-					                   {button.right - 3, button.top + 2}, accent);
-					dc.draw_solid_line({button.left + 2, button.bottom - 3},
-					                   {button.right - 3, button.bottom - 3}, accent);
-					dc.draw_solid_line({button.left + 2, button.top + 2},
-					                   {button.left + 2, button.bottom - 3}, accent);
-					dc.draw_solid_line({button.right - 3, button.top + 2},
-					                   {button.right - 3, button.bottom - 3}, accent);
-				}
-			}
+			_performance->layout(mc, offset_rect(l.page, menu_height));
+			_process_view->layout(mc, offset_rect(l.primary_pane, menu_height));
+			_module_view->layout(mc, offset_rect(l.secondary_pane, menu_height));
+			_network_view->layout(mc, offset_rect(l.page, menu_height));
+			_window_view->layout(mc, offset_rect(l.primary_pane, menu_height));
+			_property_view->layout(mc, offset_rect(l.secondary_pane, menu_height));
+			_about->layout(mc, offset_rect(l.page, menu_height));
+			_filter_edit->layout(mc, offset_rect(l.filter, menu_height));
+			for (size_t i = 0; i < _action_buttons.size() && i < l.buttons.size(); ++i)
+				_action_buttons[i]->layout(mc, offset_rect(l.buttons[i], menu_height));
+			for (size_t i = l.buttons.size(); i < _action_buttons.size(); ++i)
+				_action_buttons[i]->layout(mc, {0, 0, 0, 0});
 		}
 
-		void paint_performance(pf::draw_context& dc, const pf::irect bounds)
+		void paint_performance(render::draw_context& dc, const core::recti bounds)
 		{
-			dc.fill_solid_rect(bounds, _theme.window_background);
+			dc.draw_rect(bounds, core::color(_theme.window_background, dc.colors.alpha));
 			const auto scale = _theme.dpi_scale;
 			const auto pad = sysmate::ui::scale(4, scale);
 			const auto spacing = sysmate::ui::scale(8, scale);
@@ -1702,31 +1118,25 @@ namespace
 			const auto rows = (chart_count + columns - 1) / columns;
 			const auto chart_width = bounds.width() / columns - spacing;
 			const auto chart_height = bounds.height() / rows - spacing;
-			if (chart_width < sysmate::ui::scale(50, scale) ||
-				chart_height < sysmate::ui::scale(30, scale))
-				return;
+			if (chart_width < sysmate::ui::scale(50, scale) || chart_height < sysmate::ui::scale(30, scale)) return;
 
 			const auto text_margin = sysmate::ui::scale(16, scale);
 			const auto text_top = sysmate::ui::scale(8, scale);
 			const auto text_bottom = sysmate::ui::scale(34, scale);
 			const auto detail_bottom = sysmate::ui::scale(50, scale);
 			const auto value_margin = sysmate::ui::scale(160, scale);
-
+			const auto face = render::make_font(_theme.list_font);
 			static constexpr ChartColor palette[chart_count][2] = {
-				{{0, 180, 255}, {0, 120, 200}},
-				{{180, 0, 255}, {140, 0, 200}},
-				{{0, 200, 100}, {0, 150, 80}},
-				{{255, 180, 0}, {200, 140, 0}},
-				{{255, 80, 80}, {200, 50, 50}},
-				{{100, 220, 220}, {60, 170, 170}}};
+				{{0, 180, 255}, {0, 120, 200}}, {{180, 0, 255}, {140, 0, 200}},
+				{{0, 200, 100}, {0, 150, 80}}, {{255, 180, 0}, {200, 140, 0}},
+				{{255, 80, 80}, {200, 50, 50}}, {{100, 220, 220}, {60, 170, 170}}};
 
 			for (int i = 0; i < chart_count; ++i)
 			{
 				const auto column = i % columns;
 				const auto row = i / columns;
-				const auto x = pad + column * (chart_width + spacing);
-				const auto y = pad + row * (chart_height + spacing);
-
+				const auto x = bounds.left + pad + column * (chart_width + spacing);
+				const auto y = bounds.top + pad + row * (chart_height + spacing);
 				auto& chart = _charts[i];
 				chart.resize(chart_width, chart_height);
 				ChartStyle style;
@@ -1736,146 +1146,129 @@ namespace
 				chart.set_margin(sysmate::ui::scale(8, scale));
 				chart.set_data(_history[i]);
 				chart.render();
+				if (!_chart_surfaces[i] || _chart_surfaces[i]->dimensions() != core::sizei(chart.width(), chart.height()))
+				{
+					_chart_surfaces[i] = std::make_shared<core::surface>();
+					_chart_surfaces[i]->alloc(chart.width(), chart.height(), core::texture_format::ARGB);
+				}
+				for (int py = 0; py < chart.height(); ++py)
+					std::memcpy(_chart_surfaces[i]->pixels_line(py),
+					            chart.pixels().data() + static_cast<size_t>(py) * chart.width(),
+					            static_cast<size_t>(chart.width()) * sizeof(uint32_t));
+				render::draw_surface(dc, _chart_surfaces[i], {x, y, x + chart_width, y + chart_height},
+				                     1.0f, render::texture_sampler::point);
 
-				pf::bitmap bitmap(chart.width(), chart.height(), chart.pixels());
-				dc.draw_bitmap(x, y, bitmap);
-
-				draw_text(dc, chart_names[i], _theme.list_font, _theme.text,
-				          _theme.window_background,
-				          {x + text_margin, y + text_top, x + chart_width - spacing, y + text_bottom});
+				const auto text_color = core::color(_theme.text, dc.colors.alpha);
+				const auto dim_color = core::color(_theme.dim_text, dc.colors.alpha);
+				dc.draw_text(chart_names[i], {x + text_margin, y + text_top, x + chart_width - spacing, y + text_bottom},
+				             face, render::text_style::single_line, text_color, core::color(0, 0, 0, 0));
 				std::string value;
-				if (i == static_cast<int>(chart_id::network))
-					value = format_rate(_sample.network_bytes_per_second);
-				else if (i == static_cast<int>(chart_id::handles))
-					value = std::format("{}", _sample.handle_count);
-				else if (i == static_cast<int>(chart_id::gpu) && !_sample.gpu_available)
-					value = "n/a";
+				if (i == 3) value = format_rate(_sample.network_bytes_per_second);
+				else if (i == 5) value = std::format("{}", _sample.handle_count);
+				else if (i == 4 && !_sample.gpu_available) value = "n/a";
 				else
 				{
 					const auto latest = _history[i].empty() ? 0.0f : _history[i].back();
 					value = std::format("{:.1f}%", latest);
 				}
-				const auto value_size = dc.measure_text(value, _theme.list_font);
-				draw_text(dc, value, _theme.list_font, _theme.text,
-				          _theme.window_background,
-				          {x + chart_width - value_margin, y + text_top,
-				           x + chart_width - text_margin, y + text_bottom});
-				(void)value_size;
+				dc.draw_text(value, {x + chart_width - value_margin, y + text_top,
+				                     x + chart_width - text_margin, y + text_bottom},
+				             face, render::text_style::single_line_far, text_color, core::color(0, 0, 0, 0));
 
 				std::string detail;
-				switch (static_cast<chart_id>(i))
+				switch (i)
 				{
-				case chart_id::cpu:
+				case 0:
 					detail = _hardware.cpu_name.empty()
-					             ? std::format("{} logical cores @ {:.2f} GHz",
-					                           _hardware.logical_cores, _hardware.cpu_mhz / 1000.0)
-					             : std::format("{}  ({} cores @ {:.2f} GHz)",
-					                           _hardware.cpu_name, _hardware.logical_cores,
+					             ? std::format("{} logical cores @ {:.2f} GHz", _hardware.logical_cores, _hardware.cpu_mhz / 1000.0)
+					             : std::format("{}  ({} cores @ {:.2f} GHz)", _hardware.cpu_name, _hardware.logical_cores,
 					                           _hardware.cpu_mhz / 1000.0);
 					break;
-				case chart_id::memory:
+				case 1:
 					detail = std::format("Used {} / {}  (Available {})",
 						format_bytes(_sample.memory_total_bytes - _sample.memory_available_bytes),
-						format_bytes(_sample.memory_total_bytes),
-						format_bytes(_sample.memory_available_bytes));
+						format_bytes(_sample.memory_total_bytes), format_bytes(_sample.memory_available_bytes));
 					break;
-				case chart_id::disk:
-					detail = std::format("{}:  Used {} / {}  (Free {})",
-						_hardware.system_drive,
+				case 2:
+					detail = std::format("{}:  Used {} / {}  (Free {})", _hardware.system_drive,
 						format_bytes(_sample.disk_total_bytes - _sample.disk_free_bytes),
-						format_bytes(_sample.disk_total_bytes),
-						format_bytes(_sample.disk_free_bytes));
+						format_bytes(_sample.disk_total_bytes), format_bytes(_sample.disk_free_bytes));
 					break;
-				case chart_id::network:
-					detail = "Scale " + format_rate(_network_peak) + " (peak seen)";
-					break;
-				case chart_id::gpu:
-					detail = _sample.gpu_available
+				case 3: detail = "Scale " + format_rate(_network_peak) + " (peak seen)"; break;
+				case 4: detail = _sample.gpu_available
 					             ? (_hardware.gpu_name.empty() ? "Busiest engine" : _hardware.gpu_name)
 					             : (_hardware.gpu_name.empty() ? "GPU counters unavailable" : _hardware.gpu_name);
 					break;
-				case chart_id::handles:
-					detail = "Total system handles";
-					break;
+				case 5: detail = "Total system handles"; break;
+				default: break;
 				}
 				if (!detail.empty())
-					draw_text(dc, detail, _theme.list_font, _theme.dim_text,
-					          _theme.window_background,
-					          {x + text_margin, y + text_bottom,
-					           x + chart_width - spacing, y + detail_bottom});
+					dc.draw_text(detail, {x + text_margin, y + text_bottom, x + chart_width - spacing, y + detail_bottom},
+					             face, render::text_style::single_line, dim_color, core::color(0, 0, 0, 0));
 			}
 		}
 
 		void sample_performance()
 		{
 			_sample = _monitor.sample();
-			if (_sample.network_bytes_per_second > _network_peak)
-				_network_peak = _sample.network_bytes_per_second * 1.2;
-			if (_sample.handle_count > _handle_peak)
-				_handle_peak = static_cast<uint64_t>(_sample.handle_count * 1.2);
-
+			if (_sample.network_bytes_per_second > _network_peak) _network_peak = _sample.network_bytes_per_second * 1.2;
+			if (_sample.handle_count > _handle_peak) _handle_peak = static_cast<uint64_t>(_sample.handle_count * 1.2);
 			const std::array<float, chart_count> values = {
 				static_cast<float>(std::clamp(_sample.cpu_percent, 0.0, 100.0)),
 				static_cast<float>(_sample.memory_load),
 				static_cast<float>(std::clamp(_sample.disk_percent, 0.0, 100.0)),
-				static_cast<float>(std::clamp(_sample.network_bytes_per_second /
-				                              _network_peak * 100.0, 0.0, 100.0)),
+				static_cast<float>(std::clamp(_sample.network_bytes_per_second / _network_peak * 100.0, 0.0, 100.0)),
 				static_cast<float>(std::clamp(_sample.gpu_percent, 0.0, 100.0)),
 				static_cast<float>(std::clamp(static_cast<double>(_sample.handle_count) /
-				                              std::max<uint64_t>(1, _handle_peak) * 100.0,
-				                              0.0, 100.0))};
+				                              std::max<uint64_t>(1, _handle_peak) * 100.0, 0.0, 100.0))};
 			for (int i = 0; i < chart_count; ++i)
 			{
 				_history[i].push_back(values[i]);
 				while (_history[i].size() > 60) _history[i].pop_front();
 			}
-			if (_performance_frame) _performance_frame->invalidate();
+			if (_frame) _frame->invalidate();
 		}
 
 		void offscreen_check(const bool condition, const std::string_view message)
 		{
 			if (!condition) _offscreen_ok = false;
-			pf::write_stdout(std::format("offscreen: {} {}\n",
-				condition ? "PASS" : "FAIL", message));
+			platform::write_stdout(std::format("offscreen: {} {}\n", condition ? "PASS" : "FAIL", message));
 		}
 
-		void run_offscreen_step(const pf::window_frame_ptr& window)
+		void run_offscreen_step()
 		{
 			switch (_offscreen_step++)
 			{
 			case 0:
 				switch_tab(static_cast<int>(tab_id::processes));
-				offscreen_check(_process_view->select_first_for_test(),
-				                "process selection is reachable");
+				offscreen_check(_process_view->select_first_for_test(), "process selection is reachable");
 				_offscreen_selected = _process_view->selected_id();
 				break;
 			case 1:
 				refresh_processes();
-				offscreen_check(_offscreen_selected != 0 &&
-				                _process_view->selected_id() == _offscreen_selected,
+				offscreen_check(_offscreen_selected != 0 && _process_view->selected_id() == _offscreen_selected,
 				                "selection identity survives refresh");
 				break;
 			case 2:
 				switch_tab(static_cast<int>(tab_id::network));
-				offscreen_check(_network_view != nullptr, "network reactor survives tab switch");
+				offscreen_check(_network_view != nullptr, "network view survives tab switch");
 				break;
 			case 3:
 				switch_tab(static_cast<int>(tab_id::windows));
-				offscreen_check(_window_view != nullptr, "window reactor survives tab switch");
+				offscreen_check(_window_view != nullptr, "window view survives tab switch");
 				break;
 			case 4:
 				switch_tab(static_cast<int>(tab_id::about));
-				offscreen_check(_about_view != nullptr, "about reactor survives tab switch");
+				offscreen_check(_about != nullptr, "about view survives tab switch");
 				break;
 			case 5:
 				switch_tab(static_cast<int>(tab_id::performance));
-				offscreen_check(_performance_view != nullptr, "chart reactor survives tab switch");
+				offscreen_check(_performance != nullptr, "chart view survives tab switch");
 				break;
 			default:
-				window->kill_timer(offscreen_timer);
-				pf::write_stdout(std::format("offscreen: lifecycle {}\n",
-					_offscreen_ok ? "passed" : "FAILED"));
-				window->close();
+				platform::write_stdout(std::format("offscreen: lifecycle {}\n", _offscreen_ok ? "passed" : "FAILED"));
+				if (_frame) _frame->close();
+				_offscreen_step = -1;
 				break;
 			}
 		}
@@ -1883,390 +1276,387 @@ namespace
 		void ui_test_check(const bool condition, const std::string_view message)
 		{
 			if (!condition) _offscreen_ok = false;
-			pf::write_stdout(std::format("ui-test: {} {}\n",
-				condition ? "PASS" : "FAIL", message));
+			platform::write_stdout(std::format("ui-test: {} {}\n", condition ? "PASS" : "FAIL", message));
 		}
 
-		void run_ui_test(pf::window_frame_ptr window)
+		void run_ui_test()
 		{
 			switch_tab(static_cast<int>(tab_id::processes));
-			const auto client = _process_frame->get_client_rect();
-			ui_test_check(client.width() > 0 && client.height() > 0,
+			ui_test_check(_process_view->bounds.width() > 0 && _process_view->bounds.height() > 0,
 			              "real process client geometry");
-			ui_test_check(_process_view->row_count_for_test() == 2,
-			              "deterministic fixture rows");
+			ui_test_check(_process_view->row_count_for_test() == 2, "deterministic fixture rows");
 
-			pf::ui::test::fake_draw_context draw;
-			_process_view->handle_paint(_process_frame, draw);
-			ui_test_check(!draw.texts.empty() && !draw.fills.empty(),
-			              "actual list reactor records drawing");
+			ui::test::fake_draw_context draw;
+			_process_view->paint(draw, false);
+			ui_test_check(!draw.texts.empty() && !draw.fills.empty(), "actual list view records drawing");
 
-			pf::mouse_params header_click;
-			header_click.point = {10, 2};
-			_process_view->handle_mouse(_process_frame,
-				pf::mouse_message_type::left_button_down, header_click);
-			const auto sorted = std::static_pointer_cast<process_info>(
-				_process_view->payload_for_test(0));
-			ui_test_check(sorted && sorted->pid == 41002,
-			              "actual header click sorts fixture rows");
+			_process_view->on_mouse_down({10, 2}, {});
+			const auto sorted = std::static_pointer_cast<process_info>(_process_view->payload_for_test(0));
+			ui_test_check(sorted && sorted->pid == 41002, "actual header click sorts fixture rows");
 
-			ui_test_check(_process_view->select_first_for_test(),
-			              "actual list selection callback");
+			ui_test_check(_process_view->select_first_for_test(), "actual list selection callback");
 			const auto selected_payload = _process_view->selected_data();
 			const auto selected_id = _process_view->selected_id();
 			refresh_processes();
 			ui_test_check(selected_id != 0 && _process_view->selected_id() == selected_id &&
-			              _process_view->selected_data() == selected_payload,
-			              "refresh preserves payload identity");
+			             _process_view->selected_data() == selected_payload,
+			             "refresh preserves payload identity");
 
-			const auto columns = _process_view->column_rects(client.width());
-			pf::mouse_params drag_start;
-			drag_start.point = {columns.front().right, 2};
-			_process_view->handle_mouse(_process_frame,
-				pf::mouse_message_type::left_button_down, drag_start);
-			ui_test_check(_process_view->header_drag_active_for_test(),
-			              "header drag captures");
-			_process_view->handle_message(_process_frame,
-				pf::message_type::capture_changed, {});
-			ui_test_check(!_process_view->header_drag_active_for_test(),
-			              "capture loss cancels header drag");
+			const auto columns = _process_view->column_rects(_process_view->bounds.width());
+			if (!columns.empty())
+			{
+				_process_view->on_mouse_down({columns.front().right, 2}, {});
+				ui_test_check(_process_view->header_drag_active_for_test(), "header drag captures");
+				_process_view->on_mouse_move({columns.front().right + 10, 2}, false);
+				ui_test_check(!_process_view->header_drag_active_for_test(), "capture loss cancels header drag");
+			}
 
-			if (auto measure = window->create_measure_context())
-				handle_size(window, {0, 0}, *measure);
-			ui_test_check(true, "minimized zero-extent layout is handled");
+			// An offscreen window never takes the keyboard, so the focus is the control its input manager holds.
+			const auto input = _filter_edit->input();
+			_filter_edit->window_text({});
+			_filter_edit->focus();
+			_filter_edit->on_text("\xC3\xA9");
+			_filter_edit->on_text("\xE7\x8C\xAB");
+			ui_test_check(_filter_edit->window_text() == "\xC3\xA9\xE7\x8C\xAB",
+			              "real filter accepts UTF-8 input");
+			ui_test_check(input && input->focused() == _filter_edit, "filter takes focus");
 
-			auto fake_window = std::make_shared<pf::ui::test::fake_window_frame>();
-			fake_window->set_focus();
-			switch_tab(static_cast<int>(tab_id::processes));
-			_filter_view->set_text({});
-			_filter_view->focus_select_all(fake_window);
-			pf::keyboard_params character;
-			character.ch = U'\u00e9';
-			_filter_view->handle_keyboard(fake_window,
-				pf::keyboard_message_type::char_input, character);
-			character.ch = U'\u732b';
-			_filter_view->handle_keyboard(fake_window,
-				pf::keyboard_message_type::char_input, character);
-			ui_test_check(_filter_view->text() == "\xC3\xA9\xE7\x8C\xAB",
-			              "filter accepts UTF-8 input");
+			_filter_edit->on_key('A', {true, false, false});
+			_filter_edit->on_text("x");
+			ui_test_check(_filter_edit->window_text() == "x", "filter Ctrl+A selects UTF-8 text");
 
-			fake_window->held_keys.insert(pf::platform_key::Control);
-			pf::keyboard_params key;
-			key.vk = 'A';
-			_filter_view->handle_keyboard(fake_window,
-				pf::keyboard_message_type::key_down, key);
-			ui_test_check(_filter_view->selected_text_for_test() == _filter_view->text(),
-			              "filter Ctrl+A selects UTF-8 text");
-			key.vk = 'C';
-			_filter_view->handle_keyboard(fake_window,
-				pf::keyboard_message_type::key_down, key);
-			const auto clipboard_available = pf::platform_clipboard_has_text();
-			_filter_view->set_text({});
-			key.vk = 'V';
-			_filter_view->handle_keyboard(fake_window,
-				pf::keyboard_message_type::key_down, key);
-			ui_test_check(!clipboard_available ||
-			              _filter_view->text() == "\xC3\xA9\xE7\x8C\xAB",
-			              "filter clipboard round trip");
-			fake_window->held_keys.clear();
+			_filter_edit->window_text("\xC3\xA9\xE7\x8C\xAB");
+			_filter_edit->on_key('A', {true, false, false});
+			_filter_edit->on_key('C', {true, false, false});
+			const auto clipboard = platform::clipboard_text();
+			_filter_edit->window_text({});
+			_filter_edit->on_key('V', {true, false, false});
+			ui_test_check(!clipboard || _filter_edit->window_text() == "\xC3\xA9\xE7\x8C\xAB",
+			              "real filter Ctrl+A clipboard round trip");
 
-			key.vk = pf::platform_key::Tab;
-			_filter_view->handle_keyboard(fake_window,
-				pf::keyboard_message_type::key_down, key);
-			ui_test_check(_focus.target == sysmate::ui::focus_target::table,
-			              "filter Tab routes focus to table");
-			_process_view->handle_keyboard(fake_window,
-				pf::keyboard_message_type::key_down, key);
-			ui_test_check(_focus.target == sysmate::ui::focus_target::actions,
-			              "table Tab routes focus to actions");
+			// Tab goes as the frame sends it: to the application, which leaves it, then to the controls.
+			const auto tab = [this, &input]
+			{
+				return !key_down(platform::keys::TAB, {}) && input && input->key_down(platform::keys::TAB, {});
+			};
+			ui_test_check(tab() && input->focused() == _process_view, "filter Tab routes focus to table");
+			ui_test_check(tab() && input->focused() == _module_view, "table Tab routes focus to modules");
+			ui_test_check(tab() && input->focused() == _action_buttons[0], "modules Tab routes focus to actions");
 
-			window->kill_timer(ui_test_timer);
-			pf::write_stdout(std::format("ui-test: lifecycle {}\n",
-				_offscreen_ok ? "passed" : "FAILED"));
-			window->close();
+			ui::test::fake_measure_context zero_metrics;
+			_root->layout(zero_metrics, {0, 0, 0, 0});
+			ui_test_check(true, "zero-extent layout is handled");
+			if (_frame) _frame->layout();
+
+			platform::write_stdout(std::format("ui-test: lifecycle {}\n", _offscreen_ok ? "passed" : "FAILED"));
+			if (_frame) _frame->close();
+			_ui_test_done = true;
+		}
+
+		void rebuild_filter_edit()
+		{
+			const auto old = _filter_edit;
+			const auto text = old ? old->window_text() : std::string{};
+			const auto was_focused = old && old->has_focus();
+			ui::edit_styles styles;
+			styles.font = render::make_font(_theme.edit_font);
+			styles.rounded_corners = false;
+			_filter_edit = ui::make_edit(styles, text, [this](const std::string& value)
+			{
+				_filters[static_cast<size_t>(_tab)] = value;
+				refresh_current();
+			});
+			_filter_edit->set_background(_theme.tool_background);
+			_filter_edit->traits.forwards_unhandled_keys = true;
+			if (_root && old)
+				for (auto& child : _root->children)
+					if (child == old) child = _filter_edit;
+			if (was_focused) _filter_edit->focus();
+		}
+
+		void paint_tabs(render::draw_context& dc, const core::recti) const
+		{
+			const auto face = render::make_font(_theme.list_font);
+			for (int i = 0; i < sysmate::ui::tab_count; ++i)
+			{
+				const auto rect = _tab_buttons[i]->bounds;
+				const auto selected = i == static_cast<int>(_tab);
+				dc.draw_rect(rect, core::color(selected ? _theme.handle : _theme.window_background, dc.colors.alpha));
+				if (selected)
+					dc.draw_rect({rect.left, rect.top, rect.right,
+					             rect.top + sysmate::ui::scale(2, _theme.dpi_scale)},
+					             core::color(core::rgb(0, 150, 230), dc.colors.alpha));
+				dc.draw_text(tab_names[i], rect, face, render::text_style::single_line_center,
+				             core::color(selected ? _theme.text : _theme.dim_text, dc.colors.alpha),
+				             core::color(0, 0, 0, 0));
+			}
+		}
+
+		void build_ui()
+		{
+			_menus = make_menu();
+			_menu_bar = ui::make_menu_bar(_menus);
+			for (int i = 0; i < sysmate::ui::tab_count; ++i)
+				_tab_buttons[i] = ui::make_check_button(i == 0, {}, true, [this, i](const bool checked)
+				{
+					if (checked) switch_tab(i);
+				}, 1);
+			for (size_t i = 0; i < _action_buttons.size(); ++i)
+				_action_buttons[i] = ui::make_button("", [this, i] { action(static_cast<int>(i)); });
+
+			rebuild_filter_edit();
+
+			_process_view = std::make_shared<table_view>(_theme, std::vector<ui::list_column>{
+				{"Name", 200}, {"PID", 70, true}, {"Memory", 100, true}});
+			_module_view = std::make_shared<table_view>(_theme, std::vector<ui::list_column>{
+				{"Module", 180}, {"Path", 300}, {"Size", 80, true}});
+			_network_view = std::make_shared<table_view>(_theme, std::vector<ui::list_column>{
+				{"Proto", 60}, {"Local Address", 190}, {"Remote Address", 190},
+				{"State", 110}, {"PID", 70, true}, {"Process", 160}});
+			_window_view = std::make_shared<table_view>(_theme, std::vector<ui::list_column>{
+				{"Title", 250}, {"Class", 150}, {"PID", 70, true}, {"Handle", 100}});
+			_property_view = std::make_shared<table_view>(_theme, std::vector<ui::list_column>{{"Property", 120}, {"Value", 300}});
+			_module_view->set_empty_text("Modules unavailable (access denied)");
+
+			const auto weak = weak_self();
+			_process_view->set_on_selection([weak](std::shared_ptr<void> data)
+			{
+				if (const auto self = weak.lock()) self->process_selected(data);
+			});
+			_process_view->set_popup([weak](std::shared_ptr<void> data)
+			{
+				if (const auto self = weak.lock()) return self->popup_for_process(data);
+				return std::vector<ui::command_ptr>{};
+			});
+			_module_view->set_popup([weak](std::shared_ptr<void> data)
+			{
+				if (const auto self = weak.lock()) return self->popup_for_module(data);
+				return std::vector<ui::command_ptr>{};
+			});
+			_window_view->set_on_selection([weak](std::shared_ptr<void> data)
+			{
+				if (const auto self = weak.lock()) self->window_selected(data);
+			});
+			_window_view->set_popup([weak](std::shared_ptr<void> data)
+			{
+				if (const auto self = weak.lock()) return self->popup_for_window(data);
+				return std::vector<ui::command_ptr>{};
+			});
+
+			_performance = std::make_shared<performance_element>([this](render::draw_context& dc, core::recti bounds)
+			{
+				paint_performance(dc, bounds);
+			});
+			_about = std::make_shared<about_element>(_theme, [this]
+			{
+				if (_frame) _frame->invalidate();
+			});
+
+			_root = std::make_shared<dashboard_element>();
+			_root->children = {_menu_bar};
+			for (const auto& button : _tab_buttons) _root->children.push_back(button);
+			_root->children.push_back(_filter_edit);
+			_root->children.push_back(_performance);
+			_root->children.push_back(_process_view);
+			_root->children.push_back(_module_view);
+			_root->children.push_back(_network_view);
+			_root->children.push_back(_window_view);
+			_root->children.push_back(_property_view);
+			_root->children.push_back(_about);
+			for (const auto& button : _action_buttons) _root->children.push_back(button);
+			_root->paint_decoration = [this](render::draw_context& dc, const core::recti bounds)
+			{
+				paint_tabs(dc, bounds);
+			};
+			_root->layout_children = [this](render::measure_context& mc, const core::recti bounds)
+			{
+				layout_root(mc, bounds);
+			};
+			update_visibility();
 		}
 
 	public:
-		void release_reactors()
+		bool pre_init() override { return true; }
+
+		bool parse_command_line(const std::string_view command_line) override
 		{
-			for (const auto& child : {_performance_frame, _process_frame, _module_frame,
-				_network_frame, _window_frame, _property_frame, _about_frame, _filter_frame})
-				if (child) child->set_reactor({});
-
-			_performance_view.reset();
-			_process_view.reset();
-			_module_view.reset();
-			_network_view.reset();
-			_window_view.reset();
-			_property_view.reset();
-			_about_view.reset();
-			_filter_view.reset();
-
-			if (_frame) _frame->set_reactor({});
-			_performance_frame.reset();
-			_process_frame.reset();
-			_module_frame.reset();
-			_network_frame.reset();
-			_window_frame.reset();
-			_property_frame.reset();
-			_about_frame.reset();
-			_filter_frame.reset();
-			_frame.reset();
+			_offscreen_test = command_line.find("--test-offscreen") != std::string_view::npos ||
+			                  command_line.find("/test-offscreen") != std::string_view::npos;
+			_ui_test = command_line.find("--test-ui") != std::string_view::npos ||
+			           command_line.find("/test-ui") != std::string_view::npos;
+			return false;
 		}
 
-		explicit main_reactor(const bool offscreen_test = false,
-		                      const bool ui_test = false)
-			: _offscreen_test(offscreen_test), _ui_test(ui_test)
+		int run_console_mode() override { return 0; }
+
+		bool load_settings(const platform::setting_file_ptr& store) override
 		{
-			_theme.set_dpi(1.0);
+			_settings = platform::create_ini_file_settings(
+				platform::known_path(platform::known_folder::running_app_folder));
+			if (!_settings) _settings = store;
+			return _settings != nullptr;
+		}
+
+		bool wants_gpu() const override { return true; }
+
+		bool init(const std::string_view command_line) override
+		{
+			parse_command_line(command_line);
+			const auto initial_scale = std::max(1.0, platform::primary_screen_dpi() / 96.0);
+			_dpi_scale = initial_scale;
+			_theme.set_dpi(initial_scale);
 			for (auto& history : _history) history.assign(60, 0.0f);
+			_monitor.initialize();
+			_hardware = _monitor.hardware();
+
+			ui::frame_style style;
+			style.drawn_caption = false;
+			style.hardware_accelerated = wants_gpu();
+			style.client_size = {sysmate::ui::scale(1000, initial_scale),
+			                      sysmate::ui::scale(650, initial_scale)};
+			// The native window takes physical pixels, so install the minimum at the
+			// monitor scale rather than letting high-DPI windows become too small.
+			style.minimum_client = {sysmate::ui::scale(560, initial_scale),
+			                         sysmate::ui::scale(400, initial_scale)};
+			style.offscreen = _offscreen_test || _ui_test;
+			style.resizable = true;
+			style.colors = {_theme.window_background, _theme.text, _theme.focus_handle};
+			_frame = ui::create_app_frame(shared_from_this(), _settings, shared_from_this(), style);
+			if (!_frame) return false;
+
+			_dpi_scale = _frame->scale_factor();
+			_theme.set_dpi(_dpi_scale);
+			build_ui();
+
+			const auto summary = sysmate::native::collect_system_summary(_hardware);
+			const auto computer = std::find_if(summary.begin(), summary.end(),
+				[](const auto& item) { return item.first == "Computer Name"; });
+			_frame->window_text(computer == summary.end() ? "SysMate" : "SysMate - " + computer->second);
+			_frame->layout();
+			initialize_ui_fixture();
+			refresh_current();
+			platform::set_frame_delay(50);
+			return true;
 		}
 
-		[[nodiscard]] std::vector<pf::menu_command> make_menu() { return menu(); }
-
-		uint32_t handle_message(pf::window_frame_ptr window,
-		                       const pf::message_type message,
-		                       const pf::message_params& params) override
+		ui::focus_mode focus_mode() const override
 		{
-			if (message == pf::message_type::create)
+			return _filter_edit && _filter_edit->has_focus() ? ui::focus_mode::text_edit : ui::focus_mode::view;
+		}
+
+		bool text_input(std::string_view) override { return false; }
+
+		void track_menu(const ui::frame_ptr& parent, const core::recti bounds,
+		               const std::vector<ui::command_ptr>& commands) override
+		{
+			if (parent) parent->track_menu(bounds, commands);
+		}
+
+		bool key_down(const char32_t key, const platform::key_state keys) override
+		{
+			if (_tab == tab_id::about && _about && !keys.control && _about->key_down(static_cast<int>(key)))
+				return true;
+			if (ui::dispatch_accelerator(_menus, key, keys)) return true;
+			if (keys.control && !keys.shift && !keys.alt && key == 'F' && has_filter())
 			{
-				_frame = window;
-				_theme.set_dpi(window->get_dpi_scale());
-				window->set_minimum_client_size(
-					{sysmate::ui::scale(560, _theme.dpi_scale),
-					 sysmate::ui::scale(400, _theme.dpi_scale)});
-				_monitor.initialize();
-				_hardware = _monitor.hardware();
-				const auto summary = sysmate::native::collect_system_summary(_hardware);
-				auto computer = std::find_if(summary.begin(), summary.end(),
-					[](const auto& item) { return item.first == "Computer Name"; });
-				window->set_text(computer == summary.end() ? "SysMate"
-				                                             : "SysMate - " + computer->second);
-				create_children(window);
-				initialize_ui_fixture();
-				window->set_timer(performance_timer, 1000);
-				if (_offscreen_test) window->set_timer(offscreen_timer, 50);
-				if (_ui_test) window->set_timer(ui_test_timer, 50);
-				refresh_current();
-				layout_children();
-				return 0;
+				_filter_edit->focus();
+				_filter_edit->select_all();
+				return true;
 			}
-			if (message == pf::message_type::erase_background) return 1;
-			if (message == pf::message_type::timer && params.timer_id == performance_timer)
+			if (_frame && (key == platform::keys::LEFT || key == platform::keys::RIGHT))
 			{
-				sample_performance();
-				return 0;
+				const auto focused = _frame->focused_control();
+				for (int i = 0; i < sysmate::ui::tab_count; ++i)
+					if (focused == _tab_buttons[i])
+					{
+						switch_tab((static_cast<int>(_tab) +
+							(key == platform::keys::RIGHT ? 1 : 4)) % sysmate::ui::tab_count);
+						return true;
+					}
 			}
-			if (message == pf::message_type::timer && params.timer_id == offscreen_timer)
+			return false;
+		}
+
+		bool key_down(const int key, const platform::key_state keys) override
+		{
+			return key_down(static_cast<char32_t>(key), keys);
+		}
+
+		void dpi_changed() override
+		{
+			if (!_frame) return;
+			const auto scale = _frame->scale_factor();
+			if (std::abs(scale - _dpi_scale) < 0.001) return;
+			_dpi_scale = scale;
+			_theme.set_dpi(scale);
+			// Edit owns its font face, so it must be recreated; list views refresh
+			// their cached face through control::scale_changed before this callback.
+			rebuild_filter_edit();
+			update_visibility();
+			_frame->options_changed();
+			_frame->invalidate();
+		}
+
+		void on_window_layout(render::measure_context& mc, const core::sizei extent,
+		                     const bool) override
+		{
+			if (_root) _root->layout(mc, core::recti(extent));
+		}
+
+		void on_window_paint(render::draw_context& dc) override
+		{
+			if (_root) _root->render(dc, {});
+		}
+
+		void visit_elements(const std::function<void(const ui::element_ptr&, core::pointi)>& visit) override
+		{
+			if (_root) visit(_root, {});
+		}
+
+		void on_mouse_wheel(const core::pointi loc, const int delta, const platform::key_state,
+		                   bool& was_handled) override
+		{
+			if (_root && _root->wheel(loc, {}, delta))
 			{
-				run_offscreen_step(window);
-				return 0;
-			}
-			if (message == pf::message_type::timer && params.timer_id == ui_test_timer)
-			{
-				run_ui_test(window);
-				return 0;
-			}
-			if (message == pf::message_type::dpi_changed)
-			{
-				_theme.set_dpi(params.dpi_scale);
-				window->set_minimum_client_size(
-					{sysmate::ui::scale(560, _theme.dpi_scale),
-					 sysmate::ui::scale(400, _theme.dpi_scale)});
-				layout_children();
-				for (const auto& child : {_performance_frame, _process_frame, _module_frame,
-					_network_frame, _window_frame, _property_frame, _about_frame, _filter_frame})
-					if (child) child->notify_size();
+				was_handled = true;
 				if (_frame) _frame->invalidate();
-				return 0;
 			}
-			if (message == pf::message_type::set_focus)
-			{
-				focus_by_tab();
-				return 0;
-			}
-			if (message == pf::message_type::close)
-			{
-				window->close();
-				return 0;
-			}
-			if (message == pf::message_type::destroy)
-			{
-				window->kill_timer(performance_timer);
-				return 0;
-			}
-			return 0;
 		}
 
-		uint32_t handle_mouse(pf::window_frame_ptr window,
-		                      const pf::mouse_message_type message,
-		                      const pf::mouse_params& params) override
+		void on_window_destroy() override
 		{
-			const auto client = window->get_client_rect();
-			const auto l = sysmate::ui::make_layout(
-				{client.width(), client.height()}, _theme.dpi_scale, _tab);
-			if (message == pf::mouse_message_type::set_cursor)
-			{
-				window->set_cursor_shape(pf::cursor_shape::arrow);
-				return 1;
-			}
-			if (message == pf::mouse_message_type::mouse_leave)
-			{
-				_hot_tab = -1;
-				_hot_button = -1;
-				window->invalidate();
-				return 1;
-			}
-			if (message == pf::mouse_message_type::mouse_move)
-			{
-				const auto new_tab = sysmate::ui::tab_at(l, {params.point.x, params.point.y});
-				const auto new_button = sysmate::ui::button_at(l, {params.point.x, params.point.y});
-				if (new_tab != _hot_tab || new_button != _hot_button)
-				{
-					_hot_tab = new_tab;
-					_hot_button = new_button;
-					window->track_mouse_leave();
-					window->invalidate();
-				}
-				return 1;
-			}
-			if (message != pf::mouse_message_type::left_button_down) return 0;
-
-			if (const auto tab = sysmate::ui::tab_at(l, {params.point.x, params.point.y});
-				tab >= 0)
-			{
-				_focus.target = sysmate::ui::focus_target::tabs;
-				window->set_focus();
-				switch_tab(tab);
-				return 1;
-			}
-			if (const auto button = sysmate::ui::button_at(l, {params.point.x, params.point.y});
-				button >= 0)
-			{
-				_focus.target = sysmate::ui::focus_target::actions;
-				_action_focus = button;
-				window->set_focus();
-				action(button);
-				return 1;
-			}
-			return 0;
+			_frame.reset();
+			_root.reset();
 		}
 
-		uint32_t handle_keyboard(pf::window_frame_ptr window,
-		                         const pf::keyboard_message_type message,
-		                         const pf::keyboard_params& params) override
+		void frame_tick() override
 		{
-			if (message != pf::keyboard_message_type::key_down) return 0;
-			if (params.vk == pf::platform_key::Tab)
+			const auto now = platform::monotonic_seconds();
+			if (!_sampled_once || now - _last_sample >= 1.0)
 			{
-				const auto reverse = window->is_key_down(pf::platform_key::Shift);
-				const auto action_count = _tab == tab_id::performance ? 0 :
-					_tab == tab_id::network ? 1 :
-					_tab == tab_id::about ? 3 : 3;
-				if (_focus.target == sysmate::ui::focus_target::actions &&
-					action_count > 0 &&
-					((!reverse && _action_focus + 1 < action_count) ||
-					 (reverse && _action_focus > 0)))
-				{
-					_action_focus += reverse ? -1 : 1;
-					focus_by_tab();
-					return 1;
-				}
-				_focus.advance(reverse, has_filter(), action_count > 0);
-				focus_by_tab();
-				return 1;
+				_sampled_once = true;
+				_last_sample = now;
+				sample_performance();
 			}
-			if (_focus.target == sysmate::ui::focus_target::tabs)
-			{
-				if (params.vk == pf::platform_key::Left)
-				{
-					switch_tab((static_cast<int>(_tab) + 4) % 5);
-					return 1;
-				}
-				if (params.vk == pf::platform_key::Right)
-				{
-					switch_tab((static_cast<int>(_tab) + 1) % 5);
-					return 1;
-				}
-			}
-			if (_focus.target == sysmate::ui::focus_target::actions &&
-				(params.vk == pf::platform_key::Return || params.vk == pf::platform_key::Space))
-			{
-				action(_action_focus);
-				return 1;
-			}
-			if (_focus.target == sysmate::ui::focus_target::actions)
-			{
-				const auto action_count = _tab == tab_id::performance ? 0 :
-					_tab == tab_id::network ? 1 :
-					_tab == tab_id::about ? 3 : 3;
-				if (params.vk == pf::platform_key::Left && _action_focus > 0)
-				{
-					--_action_focus;
-					return 1;
-				}
-				if (params.vk == pf::platform_key::Right &&
-					_action_focus + 1 < action_count)
-				{
-					++_action_focus;
-					return 1;
-				}
-			}
-			return 0;
+			if (_ui_test && !_ui_test_done)
+				run_ui_test();
+			else if (_offscreen_test && _offscreen_step >= 0)
+				run_offscreen_step();
 		}
 
-		void handle_paint(pf::window_frame_ptr& window, pf::draw_context& dc) override
+		void final_exit() override
 		{
-			paint_tabs_and_bar(dc, window->get_client_rect());
-		}
-
-		void handle_size(pf::window_frame_ptr&, const pf::isize,
-		                 pf::measure_context&) override
-		{
-			layout_children();
+			platform::set_frame_delay(0);
+			if (_ui_test)
+				platform::write_stdout(std::format("ui-test: weak expired {}\n",
+				                                  _root == nullptr ? "passed" : "FAILED"));
 		}
 	};
-
-	std::shared_ptr<main_reactor> g_main;
-	bool g_ui_test_run = false;
 }
 
-app_init_result app_init(const pf::window_frame_ptr& main_frame,
-                         const std::span<const std::string_view> params)
+int main(int argc, char** argv)
 {
-	pf::config_set_app_name("sys-mate");
-	const auto offscreen_test = std::ranges::any_of(params,
-		[](const std::string_view param)
-		{
-			return param == "--test-offscreen" || param == "/test-offscreen";
-		});
-	const auto ui_test = std::ranges::any_of(params,
-		[](const std::string_view param)
-		{
-			return param == "--test-ui" || param == "/test-ui";
-		});
-	g_main = std::make_shared<main_reactor>(offscreen_test || ui_test, ui_test);
-	g_ui_test_run = ui_test;
-	main_frame->set_reactor(g_main);
-	main_frame->set_menu(g_main->make_menu());
-	app_init_result result;
-	result.window.initial_client_size = {1000, 650};
-	result.window.minimum_client_size = {560, 400};
-	result.offscreen_gui = offscreen_test || ui_test;
-	return result;
-}
-
-void app_idle()
-{
-}
-
-void app_destroy()
-{
-	const auto weak = std::weak_ptr<main_reactor>(g_main);
-	if (g_main) g_main->release_reactors();
-	g_main.reset();
-	if (g_ui_test_run)
-		pf::write_stdout(std::format("ui-test: weak expired {}\n",
-			weak.expired() ? "passed" : "FAILED"));
-	g_ui_test_run = false;
+	core::set_app_name("sys-mate");
+	auto app = std::make_shared<sysmate_app>();
+	return platform::run(app, argc, argv);
 }

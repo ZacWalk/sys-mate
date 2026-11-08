@@ -1,6 +1,5 @@
-#include "ui/view_host.h"
-#include "ui/test_support.h"
-#include "ui/widgets.h"
+#include "libdesktop/ui/controls.h"
+#include "libdesktop/ui/test_support.h"
 
 #include <cstdio>
 #include <memory>
@@ -21,53 +20,32 @@ namespace
 
 int main()
 {
-	auto window = std::make_shared<pf::ui::test::fake_window_frame>();
-	window->set_focus();
+	ui::test::fake_control_host host;
+	ui::edit_styles styles;
+	auto edit = ui::make_edit(styles, {}, [](const std::string&) {});
+	auto input = std::make_shared<ui::input_manager>(&host);
+	edit->found(input, {}, true);
+	edit->layout(host.measure_context, {0, 0, 320, 30});
+	edit->focus();
+	input->keyboard_focus(true);
 
-	pf::ui::edit_box_widget input;
-	check(input.on_char(window, U'a'), "ASCII input");
-	check(input.on_char(window, U'\u00e9'), "two-byte UTF-8 input");
-	check(input.on_char(window, U'\u732b'), "three-byte UTF-8 input");
-	check(input.edit.text == "a\xc3\xa9\xe7\x8c\xab", "UTF-8 text is preserved");
-	check(input.edit.cursor_pos == static_cast<int>(input.edit.text.size()),
-	      "caret stays at UTF-8 byte end");
+	input->text_input("a");
+	input->text_input("\xC3\xA9");
+	input->text_input("\xE7\x8C\xAB");
+	check(edit->window_text() == "a\xC3\xA9\xE7\x8C\xAB", "UTF-8 char input is preserved");
 
-	window->held_keys.insert(pf::platform_key::Shift);
-	bool modified = false;
-	check(input.on_key_down(window, pf::platform_key::Left, modified), "left navigation");
-	check(input.edit.has_selection(), "shift navigation selects a code point");
-	check(input.edit.selected_text() == "\xe7\x8c\xab", "selection stays on code-point boundary");
-	window->held_keys.clear();
+	input->key_down(platform::keys::LEFT, {false, true, false});
+	check(input->key_down(platform::keys::BACK, {}), "selection backspace is handled");
+	check(edit->window_text() == "a\xC3\xA9", "selection deletion keeps UTF-8 valid");
 
-	check(input.on_char(window, U'\b'), "backspace replaces the selection");
-	check(input.edit.text == "a\xc3\xa9", "selection deletion keeps UTF-8 valid");
-
-	input.edit.select_all();
-	if (input.edit.copy_to_clipboard())
-	{
-		pf::ui::edit_box_widget pasted;
-		check(pasted.edit.paste_from_clipboard(), "clipboard paste");
-		check(pasted.edit.text == "a\xc3\xa9", "clipboard paste preserves UTF-8");
-	}
-	else
-	{
-		std::printf("clipboard unavailable: skipping clipboard round trip\n");
-	}
+	input->key_down('A', {true, false, false});
+	input->key_down('C', {true, false, false});
+	const auto clipboard = platform::clipboard_text();
+	edit->window_text({});
+	input->key_down('V', {true, false, false});
+	check(!clipboard || edit->window_text() == "a\xC3\xA9", "clipboard paste preserves UTF-8");
 
 	std::printf("filter_input: %s\n", failures == 0 ? "all checks passed" : "FAILED");
 	return failures == 0 ? 0 : 1;
 }
 
-app_init_result app_init(const pf::window_frame_ptr&,
-                         const std::span<const std::string_view>)
-{
-	return {.start_gui = false};
-}
-
-void app_idle()
-{
-}
-
-void app_destroy()
-{
-}

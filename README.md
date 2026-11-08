@@ -2,8 +2,7 @@
 
 [![Build](https://github.com/ZacWalk/sys-mate/actions/workflows/build.yml/badge.svg)](https://github.com/ZacWalk/sys-mate/actions/workflows/build.yml)
 
-A lightweight Windows system information utility built on the libdesktop
-platform layer. Uses 10% of the memory task manager uses.
+A lightweight Windows system information utility built on libdesktop's core, platform, render and ui libraries. The UI is an element tree hosted by ui::create_app_frame; monitoring stays in an explicit Win32 backend. Uses 10% of the memory task manager uses.
 
 Way back around 2000, the company I worked for still supported Windows 95 and 98 for the desktop application we sold. I typically volunteered to test on those platforms and had written my own task manager like program. Every 5 years or so I get it building and do a few updates. It started out as SysMate, went by System Stuff for a while, and is SysMate again.
 
@@ -36,7 +35,7 @@ rescales when dragged between monitors.
 
 Requires Windows x64 and Visual Studio with the Desktop C++ workload. The
 application uses the published
-[libdesktop](https://github.com/ZacWalk/libdesktop) C++20 platform layer; a
+[libdesktop](https://github.com/ZacWalk/libdesktop) C++20 core/platform/render/ui libraries; a
 sibling `..\libdesktop` checkout is used automatically during local builds.
 The vendored [dd](https://github.com/ZacWalk/dd) runtime locates Visual Studio
 and uses the CMake and Ninja that ship with it.
@@ -49,12 +48,13 @@ and uses the CMake and Ninja that ship with it.
 
 Binaries land in `exe\` as `sys-mate-64.exe`, with a `d` suffix for Debug.
 
-The test label runs seven headless unit programs in both Debug and Release:
-the build smoke check, the table sort regression, the UI model
-layout/filter/selection/focus checks, the native monitoring smoke check, and
-UTF-8 filter input checks, plus an offscreen reactor lifecycle/selection run.
-The UI entry also drives the production list/filter/focus reactors with
-deterministic rows and recorded drawing; it does not show a window.
+The test label runs its headless suite in both Debug and Release:
+the build smoke check, table sort regression, UI-model layout/filter/selection/
+focus checks, native monitoring smoke check, and the real `ui::edit` UTF-8
+key/clipboard test, plus offscreen frame lifecycle and UI runs. The UI run
+uses the production list views and filter control with deterministic rows,
+recorded drawing, focus routing, zero-size layout and lifetime checks; it does
+not show a window.
 
 ## Documentation
 
